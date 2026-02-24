@@ -116,3 +116,33 @@ This is the fastest way to verify logic changes before pushing and redeploying. 
 ### 10. Warn users when local and VM bots share the same token
 
 If the local dev instance and the VM instance both run with the same bot token simultaneously, **both will process incoming messages and both will send outgoing alerts**. Users see duplicate messages. Stop the VM services before doing a local test run, or use a separate test bot token for development.
+
+---
+
+### 11. Python stdout is buffered by default — add `PYTHONUNBUFFERED=1` to systemd services
+
+When running Python scripts as systemd services, `print()` output is buffered and does not appear in `journalctl` until the buffer flushes (or the process exits). This makes live debugging impossible.
+
+Fix: add `Environment="PYTHONUNBUFFERED=1"` to the `[Service]` block of every Python `.service` file:
+
+```ini
+[Service]
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/python3 /path/to/script.py
+```
+
+---
+
+### 12. Seed price history on first run — don't wait for organic data accumulation
+
+Alert conditions that require multiple days of history (e.g. 1-day price change, 7-day volume average) silently never fire until the monitor has run across enough separate trading days. On a fresh install this means alerts may be broken for days before the user notices.
+
+Fix: detect sparse history (fewer than 2 entries) and seed it upfront using `yf.Ticker(ticker).history(period='15d')`. Alerts work correctly from the very first monitor cycle.
+
+---
+
+### 13. Alert description logic must factor in both operator and threshold sign
+
+When generating a natural-language description for an alert (e.g. "Drops >2.5% in 1 day"), it is tempting to key only on the threshold sign. But the operator matters too. `operator='>'` with `threshold=-2.5` means "triggers when change > -2.5%" — which fires almost always and is not a drop alert at all.
+
+Always derive descriptions from the *combination* of operator and threshold. Fall back to showing the explicit condition (`1D change > -2.5%`) for unusual combinations rather than generating a misleading natural-language label.

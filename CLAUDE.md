@@ -14,10 +14,10 @@ A two-process Telegram bot system for monitoring up to 5 stocks per user. Users 
 Both processes share the same JSON file-based storage — no database.
 
 ### Deployment
-- **VM**: Google VM, SSH as `jason_tamkh@robostrategy-exit-reminder-bot`
-- **Working dir**: `~/robo-monitor/`
-- **No GitHub**: files are copied directly to VM via `nano` paste
-- **Secrets**: stored in `config.json` on the VM (not in source files)
+- **VM**: Google Cloud e2-micro (free tier), SSH as `jason_tamkh@robostrategy-exit-reminder-bot`
+- **Working dir**: `~/tg-bot-stock-monitoring/`
+- **Source control**: GitHub repo `tg-bot-stock-monitoring`; VM pulls via `git pull`
+- **Secrets**: stored in `config.json` on the VM (gitignored, never committed)
 
 ### Data Storage (JSON files)
 ```
@@ -59,12 +59,24 @@ price_history/history_{ticker}.json  # 30-day price history per ticker
 - `/cancel` → cancel active conversation
 - All stock/alert management via inline keyboard buttons
 
+### AI Advisor Feature (`ask_ai` flow)
+- Entry: "🤖 Ask AI Advice" button on main menu
+- User selects stock → Buy or Sell signal
+- Bot calls Claude Sonnet via Openrouter API (in `asyncio.to_thread` — non-blocking)
+- AI analyses: 30-day local price history + yfinance news + benchmark (SPY/^HSI) + stock info
+- AI returns either:
+  - `immediate` → display recommendation message, no alert changes
+  - `alerts` → display two-tier (watch/action) alert proposals, ask for confirmation
+- On confirm: `replace_alerts()` atomically replaces all alerts; `clear_stock_alert_states()` purges stale states
+- Module: `ai_advisor.py` — `AIAdvisor` class, all AI logic isolated here
+- Configured via `config.json` → `openrouter.api_key`; bot works normally if key is absent
+
 ## Dependencies
 ```
 python-telegram-bot   # Telegram bot framework (telegram_bot_multistock.py)
 yfinance              # Stock price data
 pytz                  # Timezone handling
-requests              # Direct Telegram API calls (robo_monitor_multistock.py)
+requests              # Direct Telegram API calls (robo_monitor_multistock.py) + Openrouter AI calls (ai_advisor.py)
 ```
 
 ## Config File Format (`config.json`)
@@ -72,9 +84,13 @@ requests              # Direct Telegram API calls (robo_monitor_multistock.py)
 {
   "telegram": {
     "bot_token": "YOUR_BOT_TOKEN"
+  },
+  "openrouter": {
+    "api_key": "YOUR_OPENROUTER_API_KEY"
   }
 }
 ```
+The `openrouter` block is optional — if absent or placeholder, the bot starts normally but the "Ask AI Advice" button shows a "not configured" message.
 
 ## User Config Format (`user_configs/config_user_{id}.json`)
 ```json
@@ -120,7 +136,7 @@ VOLUME_GRACE_PERIOD_HOURS = 2  # skip volume checks for first 2h after market op
 ### Updating the Bot (normal flow)
 ```bash
 ssh jason_tamkh@robostrategy-exit-reminder-bot
-cd ~/robo-monitor
+cd ~/tg-bot-stock-monitoring
 git pull
 sudo systemctl restart robo-config-bot.service
 sudo systemctl restart robo-monitor-bot.service
@@ -132,10 +148,16 @@ sudo systemctl restart robo-monitor-bot.service
 sudo systemctl status robo-config-bot.service
 sudo systemctl status robo-monitor-bot.service
 
-# View logs
+# View logs (live)
+sudo journalctl -u robo-monitor-bot.service -f
+sudo journalctl -u robo-config-bot.service -f
+
+# View last 100 lines
 sudo journalctl -u robo-monitor-bot.service -n 100
 sudo journalctl -u robo-config-bot.service -n 100
 ```
+
+> **Note:** Both `.service` files include `Environment="PYTHONUNBUFFERED=1"` — this is required for Python `print()` output to appear in `journalctl` in real time.
 
 ## Key Design Decisions
 - **No database**: JSON files per user keep things simple and portable

@@ -4,6 +4,7 @@ Stock Monitor Bot - Multi-Stock Version
 Track up to 5 stocks, each with custom alerts
 """
 
+import asyncio
 import json
 import os
 import uuid
@@ -20,6 +21,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler
 )
+from ai_advisor import AIAdvisor
 
 # Configuration
 CONFIG_DIR = "user_configs"
@@ -31,6 +33,7 @@ ADD_STOCK_TICKER, ADD_STOCK_NAV = range(2)
 ALERT_TYPE, ALERT_OPERATOR, ALERT_THRESHOLD, ALERT_CONFIRM = range(10, 14)
 DELETE_ALERT_ID = 20
 UPDATE_NAV, UPDATE_HEARTBEAT = 30, 31
+AI_SELECT_STOCK, AI_SELECT_SIGNAL, AI_CONFIRM_ALERTS = range(40, 43)
 
 
 class UserConfigManager:
@@ -165,6 +168,16 @@ class UserConfigManager:
 
         return False
 
+    def replace_alerts(self, user_id, stock_id, new_alerts: list) -> bool:
+        """Atomically replace ALL alerts for a stock with a new list."""
+        config = self.load(user_id)
+        for stock in config.get('stocks', []):
+            if stock['id'] == stock_id:
+                stock['alerts'] = new_alerts
+                self.save(user_id, config)
+                return True
+        return False
+
     def update_heartbeat_frequency(self, user_id, hours):
         config = self.load(user_id)
         config['heartbeat_frequency'] = hours
@@ -218,6 +231,22 @@ class AlertStateManager:
         states = self.load(user_id)
         return states.get(alert_key, False)
 
+    def clear_stock_alert_states(self, user_id, stock_id):
+        """Remove all alert state entries for a given stock (call after replacing alerts).
+
+        Old alert IDs become orphaned when alerts are replaced, so we purge their
+        state keys to prevent stale triggered/cleared states bleeding into new alerts.
+        """
+        states = self.load(user_id)
+        keys_to_remove = [k for k in states if k.startswith(f"{stock_id}_")]
+        if not keys_to_remove:
+            return
+        for k in keys_to_remove:
+            del states[k]
+        config_path = self._get_path(user_id)
+        with open(config_path, 'w') as f:
+            json.dump(states, f, indent=2)
+
 
 class PriceHistory:
     """Manages price history per ticker"""
@@ -248,6 +277,10 @@ class PriceHistory:
 config_manager = UserConfigManager(CONFIG_DIR)
 alert_state_manager = AlertStateManager(ALERT_STATE_DIR)
 price_history = PriceHistory(PRICE_HISTORY_DIR)
+
+# Populated at startup from config.json → openrouter.api_key
+# Set to None if key is missing/placeholder — UI shows "not configured" gracefully
+ai_advisor = None
 
 
 def get_user_id(update: Update):
@@ -293,6 +326,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"📊 My Stocks ({stock_count}/5)", callback_data='list_stocks')],
         [InlineKeyboardButton("➕ Add Stock", callback_data='add_stock')],
         [InlineKeyboardButton("🔍 Check Status Now", callback_data='check_status_now')],
+        [InlineKeyboardButton("🤖 Ask AI Advice", callback_data='ask_ai')],
         [InlineKeyboardButton("⏰ Heartbeat Frequency", callback_data='update_heartbeat')],
         [InlineKeyboardButton("ℹ️ Help", callback_data='help')]
     ]
@@ -1162,6 +1196,320 @@ async def update_heartbeat_entered(update: Update, context: ContextTypes.DEFAULT
         return UPDATE_HEARTBEAT
 
 
+# ========== AI ADVISOR HANDLERS ==========
+
+async def ask_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point — show the user's stock list so they can pick one to analyse."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    # Guard: AI not configured
+    if ai_advisor is None:
+        message = (
+            "🤖 *AI Advisor — Not Configured*\n\n"
+            "Add your Openrouter API key to `config.json`:\n"
+            "```\n\"openrouter\": {\"api_key\": \"sk-or-...\"}\n```\n\n"
+            "Restart the bot after saving."
+        )
+        keyboard = [[InlineKeyboardButton("« Menu", callback_data='menu')]]
+        if query:
+            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                          parse_mode='Markdown')
+        else:
+            await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                            parse_mode='Markdown')
+        return ConversationHandler.END
+
+    user_id = get_user_id(update)
+    config = config_manager.load(user_id)
+    stocks = config.get('stocks', [])
+
+    if not stocks:
+        message = (
+            "🤖 *AI Advisor*\n\n"
+            "You have no stocks in your monitoring list yet.\n"
+            "Add a stock first, then come back here."
+        )
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Stock", callback_data='add_stock')],
+            [InlineKeyboardButton("« Menu", callback_data='menu')]
+        ]
+        if query:
+            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                          parse_mode='Markdown')
+        else:
+            await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                            parse_mode='Markdown')
+        return ConversationHandler.END
+
+    message = (
+        "🤖 *AI Advisor*\n\n"
+        "Select the stock you want to analyse:"
+    )
+    keyboard = [
+        [InlineKeyboardButton(f"📈 {s['ticker']}  (NAV: ${s.get('nav', 0):.2f})",
+                              callback_data=f"aistock_{s['id']}")]
+        for s in stocks
+    ]
+    keyboard.append([InlineKeyboardButton("« Cancel", callback_data='menu')])
+
+    if query:
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                      parse_mode='Markdown')
+    else:
+        await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode='Markdown')
+
+    return AI_SELECT_STOCK
+
+
+async def ask_ai_stock_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User picked a stock — show Buy / Sell signal choice."""
+    query = update.callback_query
+    await query.answer()
+
+    stock_id = query.data.replace('aistock_', '')
+    user_id = get_user_id(update)
+
+    stock = config_manager.get_stock(user_id, stock_id)
+    if not stock:
+        await query.edit_message_text("❌ Stock not found.")
+        return ConversationHandler.END
+
+    context.user_data['ai_stock_id'] = stock_id
+    ticker = stock['ticker']
+
+    message = (
+        f"🤖 *AI Advisor — {ticker}*\n\n"
+        "What kind of signal are you looking for?"
+    )
+    keyboard = [
+        [InlineKeyboardButton("📈 Buy Signal",  callback_data='aisignal_buy')],
+        [InlineKeyboardButton("📉 Sell Signal", callback_data='aisignal_sell')],
+        [InlineKeyboardButton("« Back",         callback_data='ask_ai')]
+    ]
+    await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                  parse_mode='Markdown')
+
+    return AI_SELECT_SIGNAL
+
+
+async def ask_ai_signal_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    User chose Buy or Sell.
+    1. Show loading message immediately (edit in-place).
+    2. Call the AI in a thread (non-blocking).
+    3. Show result — immediate advice or proposed alerts.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    signal_type = "BUY" if query.data == 'aisignal_buy' else "SELL"
+    context.user_data['ai_signal_type'] = signal_type
+
+    stock_id = context.user_data.get('ai_stock_id')
+    user_id = get_user_id(update)
+
+    stock = config_manager.get_stock(user_id, stock_id)
+    if not stock:
+        await query.edit_message_text("❌ Stock not found.")
+        return ConversationHandler.END
+
+    ticker = stock['ticker']
+    nav = stock.get('nav', 0)
+
+    # ── Show loading message right away ──
+    signal_emoji = "📈" if signal_type == "BUY" else "📉"
+    await query.edit_message_text(
+        f"🤖 *AI Advisor — {ticker}*\n\n"
+        f"{signal_emoji} Analysing for *{signal_type}* signal...\n\n"
+        f"⏳ Please wait, this may take 20–40 seconds.",
+        parse_mode='Markdown'
+    )
+
+    # ── Load local price history ──
+    history_data = price_history.load(ticker)
+
+    # ── Call AI in a thread (won't block the event loop) ──
+    result = await asyncio.to_thread(
+        ai_advisor.get_advice, ticker, nav, signal_type, history_data
+    )
+
+    # ── Handle failure ──
+    if not result.get('ok'):
+        error_msg = result.get('error', 'Unknown error')
+        keyboard = [[InlineKeyboardButton("« Menu", callback_data='menu')]]
+        await query.edit_message_text(
+            f"🤖 *AI Advisor — {ticker}*\n\n"
+            f"❌ Analysis failed:\n{error_msg}\n\n"
+            f"Your existing alerts are unchanged.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    rec_type = result['recommendation_type']
+
+    # ── IMMEDIATE recommendation ──
+    if rec_type == 'immediate':
+        action  = result.get('action', signal_type)
+        summary = result.get('summary', '')
+        reasoning = result.get('reasoning', '')
+
+        action_emoji = "🟢" if action == "BUY" else "🔴"
+        message = (
+            f"🤖 *AI Advisor — {ticker}*\n\n"
+            f"{action_emoji} *Recommendation: {action} NOW*\n\n"
+            f"📊 *Summary:*\n{summary}\n\n"
+            f"🔍 *Analysis:*\n{reasoning}"
+        )
+
+        # Telegram has a 4096 char limit per message — trim reasoning if needed
+        if len(message) > 4000:
+            message = message[:3980] + "...\n_(analysis truncated)_"
+
+        keyboard = [[InlineKeyboardButton("« Menu", callback_data='menu')]]
+        await query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # ── ALERT SUGGESTIONS ──
+    if rec_type == 'alerts':
+        proposed = result.get('alerts', [])
+        summary  = result.get('summary', '')
+
+        # Store for the confirmation step
+        context.user_data['ai_proposed_alerts'] = proposed
+
+        # Count existing alerts
+        existing_count = len(stock.get('alerts', []))
+
+        # ── Build alert display ──
+        watch_alerts  = [a for a in proposed if a['tier'] == 'watch']
+        action_alerts = [a for a in proposed if a['tier'] == 'action']
+
+        def format_alert_line(a):
+            desc = config_manager._generate_description(
+                a['type'], a['operator'], a['threshold']
+            )
+            return f"• {desc}\n  _{a['rationale']}_"
+
+        watch_block = (
+            "\n".join(format_alert_line(a) for a in watch_alerts)
+            if watch_alerts else "  _(none)_"
+        )
+        action_block = (
+            "\n".join(format_alert_line(a) for a in action_alerts)
+            if action_alerts else "  _(none)_"
+        )
+
+        replace_note = (
+            f"⚠️ This will *replace* your current {existing_count} alert(s) for {ticker}."
+            if existing_count > 0
+            else f"ℹ️ This will add {len(proposed)} new alert(s) to {ticker}."
+        )
+
+        message = (
+            f"🤖 *AI Advisor — {ticker}* ({signal_type} signal)\n\n"
+            f"📊 *Summary:*\n{summary}\n\n"
+            f"🔔 *Proposed Alerts:*\n\n"
+            f"👁 *Watch (early warning):*\n{watch_block}\n\n"
+            f"⚡ *Action (strong signal):*\n{action_block}\n\n"
+            f"{replace_note}\n\n"
+            f"Apply these alerts?"
+        )
+
+        if len(message) > 4000:
+            message = message[:3980] + "...\n_(truncated)_"
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Yes, Apply Alerts", callback_data='aiconfirm_yes'),
+                InlineKeyboardButton("❌ Cancel",            callback_data='aiconfirm_no')
+            ]
+        ]
+        await query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return AI_CONFIRM_ALERTS
+
+    # Fallback (should never reach here)
+    await query.edit_message_text("❌ Unexpected AI response type.")
+    return ConversationHandler.END
+
+
+async def ask_ai_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User confirmed or cancelled the proposed alerts."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id  = get_user_id(update)
+    stock_id = context.user_data.get('ai_stock_id')
+    stock    = config_manager.get_stock(user_id, stock_id)
+    ticker   = stock['ticker'] if stock else "Stock"
+
+    if query.data == 'aiconfirm_yes':
+        proposed = context.user_data.get('ai_proposed_alerts', [])
+
+        # Build proper alert dicts (match the format used everywhere else in the bot)
+        new_alerts = []
+        for a in proposed:
+            alert_id = f"alert_{uuid.uuid4().hex[:8]}"
+            description = config_manager._generate_description(
+                a['type'], a['operator'], a['threshold']
+            )
+            new_alerts.append({
+                "id":          alert_id,
+                "type":        a['type'],
+                "operator":    a['operator'],
+                "threshold":   a['threshold'],
+                "description": description,
+                "enabled":     True,
+                "created_at":  datetime.now().isoformat()
+            })
+
+        # Replace all alerts + clear stale alert states
+        config_manager.replace_alerts(user_id, stock_id, new_alerts)
+        alert_state_manager.clear_stock_alert_states(user_id, stock_id)
+
+        # Confirmation message listing the new alerts
+        lines = "\n".join(f"  {i+1}. {a['description']}"
+                          for i, a in enumerate(new_alerts))
+        message = (
+            f"✅ *Alerts Updated for {ticker}!*\n\n"
+            f"*New alert set ({len(new_alerts)} alert(s)):*\n"
+            f"{lines}\n\n"
+            f"The monitor will start checking these on the next cycle."
+        )
+        keyboard = [
+            [InlineKeyboardButton(f"🔔 View {ticker} Alerts", callback_data=f'alerts_{stock_id}')],
+            [InlineKeyboardButton("« Menu", callback_data='menu')]
+        ]
+
+    else:  # aiconfirm_no
+        message = (
+            f"❌ *Cancelled*\n\n"
+            f"Your existing alerts for {ticker} are unchanged."
+        )
+        keyboard = [[InlineKeyboardButton("« Menu", callback_data='menu')]]
+
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
 # ========== HELP & MISC HANDLERS ==========
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1207,6 +1555,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await list_stocks(update, context)
     elif query.data == 'check_status_now':
         await check_status_now(update, context)
+    elif query.data == 'ask_ai':
+        await ask_ai_start(update, context)
     elif query.data.startswith('stock_'):
         await stock_detail(update, context)
     elif query.data.startswith('alerts_'):
@@ -1230,6 +1580,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot"""
+    global ai_advisor
+
     try:
         with open('config.json', 'r') as f:
             main_config = json.load(f)
@@ -1237,6 +1589,17 @@ def main():
     except:
         print("ERROR: Create config.json with bot token")
         return
+
+    # Initialise AI advisor (optional — bot runs fine without it)
+    openrouter_key = (
+        main_config.get('openrouter', {}).get('api_key', '') or ''
+    ).strip()
+    if openrouter_key and openrouter_key != "YOUR_OPENROUTER_API_KEY_HERE":
+        ai_advisor = AIAdvisor(openrouter_key)
+        print("🤖 AI Advisor: enabled (Openrouter key loaded)")
+    else:
+        ai_advisor = None
+        print("🤖 AI Advisor: disabled (no Openrouter API key in config.json)")
 
     application = Application.builder().token(bot_token).build()
     application.post_init = setup_commands
@@ -1288,7 +1651,19 @@ def main():
         allow_reentry=True
     )
 
+    ask_ai_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_ai_start, pattern='^ask_ai$')],
+        states={
+            AI_SELECT_STOCK:   [CallbackQueryHandler(ask_ai_stock_selected,  pattern='^aistock_')],
+            AI_SELECT_SIGNAL:  [CallbackQueryHandler(ask_ai_signal_selected, pattern='^aisignal_')],
+            AI_CONFIRM_ALERTS: [CallbackQueryHandler(ask_ai_confirm,         pattern='^aiconfirm_')]
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command)],
+        allow_reentry=True
+    )
+
     # Add handlers
+    # ConversationHandlers must be registered before the catch-all button_callback
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('stocks', list_stocks))
     application.add_handler(CommandHandler('help', help_command))
@@ -1298,6 +1673,7 @@ def main():
     application.add_handler(delete_alert_conv)
     application.add_handler(nav_conv)
     application.add_handler(heartbeat_conv)
+    application.add_handler(ask_ai_conv)
 
     application.add_handler(CallbackQueryHandler(button_callback))
 
