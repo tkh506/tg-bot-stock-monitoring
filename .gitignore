@@ -1,0 +1,15 @@
+# Secrets — never commit
+config.json
+
+# Runtime-generated data directories
+user_configs/
+alert_states/
+price_history/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
