@@ -57,6 +57,7 @@ price_history/history_{ticker}.json  # 30-day price history per ticker
 - `/addstock` → add stock (ticker → NAV → done)
 - `/help` → help text
 - `/cancel` → cancel active conversation
+- `/ipoai` → IPO Listing Advisor (same entry as "🚀 IPO Listing Advisor" button)
 - All stock/alert management via inline keyboard buttons
 
 ### AI Advisor Feature (`ask_ai` flow)
@@ -80,6 +81,32 @@ price_history/history_{ticker}.json  # 30-day price history per ticker
 - Configured via `config.json` → `openrouter.api_key`; bot works normally if key is absent
 - **API note**: do NOT use `response_format: json_object` with Openrouter + Claude — it is OpenAI-specific and causes empty content responses; rely on prompt instruction instead
 - **Truncation guard**: `parse_and_validate()` checks `finish_reason == "length"` and raises a clear error if response was cut off
+
+### IPO Listing Advisor Feature (`ipo_advisor` flow)
+- Entry: "🚀 IPO Listing Advisor" button on main menu, or `/ipoai` command
+- **Standalone module**: `pre_ipo_advisor.py` — `PreIpoAdvisor` class; fully isolated from `ai_advisor.py` for easy future deletion
+- User selects stock → Buy or Sell signal
+- Bot calls LLM via Openrouter API (in `asyncio.to_thread` — non-blocking)
+- Model configured via `PRE_IPO_AI_MODEL` constant in `pre_ipo_advisor.py` (currently `openai/gpt-5-mini`)
+- `max_tokens = 8000` — higher than standard advisor (4000) because the DXYZ full OHLCV prompt (~240 trading days) is substantially larger
+- **Primary data source**: DXYZ (Destiny Tech100) full post-listing OHLCV via `yf.Ticker("DXYZ").history(period="max")`
+  - Listing date, open/close price, ATH (price, date, days-to-ATH), current drawdown
+  - Price at Day 7 / 30 / 60 / 90 / 180 / 365 checkpoints (via `timedelta` forward-search)
+  - Volume: listing day, 10-day post-listing avg, current 30d avg
+  - Monthly summary + full daily OHLCV table
+- **Secondary data**: target stock 1y OHLCV + news + sentiment (same pipeline as `ai_advisor.py`)
+- **AI response schema** (different from standard advisor):
+  - `dxyz_pattern_analysis` — DXYZ lifecycle phases with actual dates/prices
+  - `lifecycle_stage` — where target stock sits on the DXYZ curve
+  - `position_sizing` (SELL signal only) — `sell_pct_now` (0–100, clamped), `rationale`, `staged_approach`
+  - `news_analysis`, `sentiment_analysis`, `macro_analysis`, `summary` — same as standard advisor
+- **Telegram display**: two-message split if combined content exceeds 4096 chars
+  - Message 1: Summary → DXYZ Pattern → Lifecycle Stage → Position Sizing (SELL)
+  - Message 2: News → Sentiment → Macro → Proposed Alerts (if any)
+- **Conversation states**: 50–52 (`PRE_IPO_SELECT_STOCK`, `PRE_IPO_SELECT_SIGNAL`, `PRE_IPO_CONFIRM_ALERTS`)
+- **Callback data namespacing**: `ipo_advisor`, `ipostock_`, `iposignal_`, `ipoconfirm_` — no collision with standard advisor
+- On confirm: same `replace_alerts()` + `clear_stock_alert_states()` flow as standard advisor
+- **Note**: Only `robo-config-bot.service` needs restart after changes to this file — the monitor never calls it
 
 ## Dependencies
 ```

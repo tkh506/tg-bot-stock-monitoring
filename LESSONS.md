@@ -212,6 +212,76 @@ Side benefit: the user sees clearly organised output in Telegram, making it easi
 
 ---
 
+### 20. Use `timedelta` forward-search to find the first trading day at or after a calendar checkpoint
+
+When computing price at "Day 7 / 30 / 90 / 180 after listing" from a yfinance DataFrame, the target calendar date may fall on a weekend or holiday (no row). The correct pattern is a forward-search — find the first available trading day on or after the target date:
+
+```python
+from datetime import timedelta
+
+def price_at_day(n):
+    target_date = listing_ts + timedelta(days=n)
+    future = hist[hist.index >= target_date]
+    if future.empty:
+        return None
+    return round(float(future.iloc[0]["Close"]), 4)
+```
+
+Using `hist.loc[target_date]` directly raises `KeyError` on non-trading days. The forward-search never raises — it just returns `None` if the stock hasn't been listed long enough to reach day N yet.
+
+---
+
+### 21. Temporary / purpose-specific modules: isolate and document for easy removal
+
+When adding a feature that is explicitly temporary (e.g. post-IPO lifecycle advisor tied to a specific stock), put it in a fully standalone `.py` file that:
+- Copies (does not import) any shared helpers from the main advisor module
+- Has a prominent docstring marking it as temporary
+- Uses non-colliding callback data prefixes throughout
+- Requires no changes to shared data formats (`user_configs/`, `alert_states/`)
+
+This makes it deletable with a single `git rm pre_ipo_advisor.py` plus the corresponding edits to `telegram_bot_multistock.py` — no risk of breaking the main advisor.
+
+---
+
+### 22. Position sizing for SELL signals: anchor to the reference stock's actual drawdown data
+
+When an AI advisor recommends a sell percentage for a position, the recommendation is only actionable if it is grounded in actual historical data. For a DXYZ-style analysis:
+- Feed the AI the full OHLCV history of the reference stock (DXYZ)
+- Let the AI identify at what lifecycle stage the target stock appears to be
+- Require the `sell_pct_now` to be justified by what DXYZ did at that equivalent stage
+
+Validate the field in `parse_and_validate()` and clamp it to 0–100:
+```python
+result["position_sizing"]["sell_pct_now"] = max(0, min(100, int(sell_pct)))
+```
+This prevents the AI from returning nonsensical values (e.g. 150 or -10) without crashing.
+
+---
+
+### 23. Scale `max_tokens` to the size of the *prompt*, not just the model's verbosity
+
+Lesson 17 established that verbose models need generous `max_tokens`. This lesson adds a second axis: **the output token budget must also scale with the prompt complexity**, because a larger prompt typically elicits a more detailed response.
+
+The IPO Listing Advisor sends a much larger prompt than the standard advisor:
+- Full DXYZ OHLCV table (~240 trading days) as primary context
+- Target stock 1y OHLCV + news + sentiment on top
+
+Setting `max_tokens = 4000` (same as the standard advisor) caused `finish_reason == "length"` on every run, even though the same model with the same setting works fine for the standard advisor.
+
+**Rule:** when a new advisor or prompt variant adds a large data payload (thousands of lines of OHLCV, multiple reference stocks, etc.), double the `max_tokens` budget relative to the base advisor as a starting point. For the DXYZ advisor, 4000 → 8000 was sufficient.
+
+```python
+# Standard advisor — 1y single-stock OHLCV
+"max_tokens": 4000
+
+# IPO Listing Advisor — DXYZ 240-day OHLCV + target stock OHLCV
+"max_tokens": 8000
+```
+
+Diagnosis signal: `finish_reason == "length"` fires consistently regardless of which stock is queried → the budget is structurally too low, not a one-off edge case.
+
+---
+
 ### 16. Use `raw_decode()` instead of `json.loads()` for AI-generated JSON
 
 `json.loads()` is strict — it rejects any characters after the closing `}`, including trailing newlines, notes, or explanations that an LLM might append. This raises `Extra data: line N column 1`.

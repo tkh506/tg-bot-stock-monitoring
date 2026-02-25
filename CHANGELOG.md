@@ -2,6 +2,61 @@
 
 ---
 
+## 2026-02-25 (session 6 — hotfix)
+
+### Hotfix — Raise `max_tokens` in IPO Listing Advisor (`pre_ipo_advisor.py`)
+
+**Problem:** Users received `"AI response was cut off (token limit reached). Please try again."` when running the IPO Listing Advisor for any stock. The `finish_reason == "length"` guard in `parse_and_validate()` was triggering because the AI response was being truncated.
+
+**Root cause:** `max_tokens` was set to `4000` in `call_openrouter()`. The DXYZ prompt is substantially larger than a typical single-stock prompt (~240 trading days of full OHLCV + target stock data), and the AI response for this richer context requires more output tokens than the existing advisor.
+
+**Fix:** Raised `max_tokens` from `4000` → `8000` in `pre_ipo_advisor.py`'s `call_openrouter()` method (line 930). Single-line change.
+
+---
+
+## 2026-02-25 (session 6)
+
+### New Feature — IPO Listing Advisor (`pre_ipo_advisor.py`, `telegram_bot_multistock.py`)
+
+Added a second, specialised AI advisor for analysing a pre-IPO / newly-listed stock by comparing it against DXYZ (Destiny Tech100) post-listing price behaviour.
+
+**Architecture:**
+- **New standalone file `pre_ipo_advisor.py`** — `PreIpoAdvisor` class. Intentionally self-contained and isolated from `ai_advisor.py` so it can be deleted without affecting the existing advisor when no longer relevant.
+- **9 targeted edits to `telegram_bot_multistock.py`** — new import, global, conversation states (50–52), menu button, four handlers, ConversationHandler registration, `button_callback` branch, `setup_commands` entry, and `main()` initialisation.
+
+**Key differences from existing AI Advisor:**
+| | Ask AI Advice | IPO Listing Advisor |
+|---|---|---|
+| Primary data | Target stock 1y OHLCV | DXYZ full post-listing OHLCV (period="max") as primary reference |
+| Signal selection | Buy / Sell | Buy / Sell |
+| Main analysis focus | General price/sector/sentiment | DXYZ lifecycle phases → target lifecycle stage |
+| Position sizing | Not included | SELL signal requires % to sell now + staged exit strategy |
+| Conversation states | 40–42 | 50–52 |
+| Entry callback | `ask_ai` / `/askai` | `ipo_advisor` / `/ipoai` |
+
+**DXYZ reference data fetched per analysis:**
+- Full OHLCV since listing via `yf.Ticker("DXYZ").history(period="max")` (~240 trading days)
+- Listing date, open/close price, ATH (price, date, days to ATH), drawdown from ATH
+- Price at Day 7 / 30 / 60 / 90 / 180 / 365 checkpoints (using `timedelta` forward-search)
+- Volume: listing day, 10-day post-listing average, current 30d average
+- Monthly summary + full daily OHLCV (all sent to AI as primary analytical framework)
+
+**AI response schema additions:**
+- `dxyz_pattern_analysis` (📊) — replaces `price_analysis` and `sector_analysis`; AI identifies DXYZ lifecycle phases with actual dates and price levels
+- `lifecycle_stage` (📍) — where target stock sits on the DXYZ lifecycle curve
+- `position_sizing` object — required for SELL signal, optional for BUY:
+  - `sell_pct_now`: integer 0–100 (clamped and validated)
+  - `rationale`: DXYZ-anchored justification
+  - `staged_approach`: when/how to exit the remainder (ties to action-tier alert thresholds)
+
+**Validation:** `parse_and_validate()` enforces `position_sizing` presence and structure for SELL signals; clamps `sell_pct_now` to 0–100.
+
+**Telegram display order (SELL):** Summary → 📊 DXYZ Pattern → 📍 Lifecycle Stage → 💰 Position Sizing → 📰 News → 💬 Sentiment → 🌐 Macro → 🔔 Proposed Alerts.
+
+**Callback data namespacing:** `ipo_advisor`, `ipostock_`, `iposignal_`, `ipoconfirm_` — no collisions with existing `ask_ai`, `aistock_`, `aisignal_`, `aiconfirm_`.
+
+---
+
 ## 2026-02-25 (session 5)
 
 ### Cleanup — Reddit API (PRAW) Fully Removed (`ai_advisor.py`, `telegram_bot_multistock.py`, `config.json.example`)

@@ -22,6 +22,7 @@ from telegram.ext import (
     ConversationHandler
 )
 from ai_advisor import AIAdvisor
+from pre_ipo_advisor import PreIpoAdvisor
 
 # Configuration
 CONFIG_DIR = "user_configs"
@@ -34,6 +35,7 @@ ALERT_TYPE, ALERT_OPERATOR, ALERT_THRESHOLD, ALERT_CONFIRM = range(10, 14)
 DELETE_ALERT_ID = 20
 UPDATE_NAV, UPDATE_HEARTBEAT = 30, 31
 AI_SELECT_STOCK, AI_SELECT_SIGNAL, AI_CONFIRM_ALERTS = range(40, 43)
+PRE_IPO_SELECT_STOCK, PRE_IPO_SELECT_SIGNAL, PRE_IPO_CONFIRM_ALERTS = range(50, 53)
 
 
 class UserConfigManager:
@@ -282,6 +284,10 @@ price_history = PriceHistory(PRICE_HISTORY_DIR)
 # Set to None if key is missing/placeholder — UI shows "not configured" gracefully
 ai_advisor = None
 
+# Pre-IPO Listing Advisor — DXYZ-anchored lifecycle analysis
+# Temporary feature; see pre_ipo_advisor.py (standalone, easy to remove)
+pre_ipo_advisor = None
+
 
 def get_user_id(update: Update):
     if update.effective_user:
@@ -311,6 +317,7 @@ async def setup_commands(application):
         BotCommand("addstock",  "Add new stock"),
         BotCommand("status",    "Check all stock prices now"),
         BotCommand("askai",     "Ask AI for stock advice"),
+        BotCommand("ipoai",     "IPO Listing Advisor (DXYZ comparison)"),
         BotCommand("heartbeat", "Set heartbeat frequency"),
         BotCommand("help",      "Show help"),
     ]
@@ -330,6 +337,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ Add Stock", callback_data='add_stock')],
         [InlineKeyboardButton("🔍 Check Status Now", callback_data='check_status_now')],
         [InlineKeyboardButton("🤖 Ask AI Advice", callback_data='ask_ai')],
+        [InlineKeyboardButton("🚀 IPO Listing Advisor", callback_data='ipo_advisor')],
         [InlineKeyboardButton("⏰ Heartbeat Frequency", callback_data='update_heartbeat')],
         [InlineKeyboardButton("ℹ️ Help", callback_data='help')]
     ]
@@ -1542,6 +1550,399 @@ async def ask_ai_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ========== IPO LISTING ADVISOR HANDLERS ==========
+
+async def ipo_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point — guard for missing API key, then show stock list."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    # Guard: pre_ipo_advisor not configured
+    if pre_ipo_advisor is None:
+        message = (
+            "🚀 *IPO Listing Advisor — Not Configured*\n\n"
+            "Add your Openrouter API key to `config.json`:\n"
+            "```\n\"openrouter\": {\"api_key\": \"sk-or-...\"}\n```\n\n"
+            "Restart the bot after saving."
+        )
+        keyboard = [[InlineKeyboardButton("« Menu", callback_data='menu')]]
+        if query:
+            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                          parse_mode='Markdown')
+        else:
+            await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                            parse_mode='Markdown')
+        return ConversationHandler.END
+
+    user_id = get_user_id(update)
+    config = config_manager.load(user_id)
+    stocks = config.get('stocks', [])
+
+    if not stocks:
+        message = (
+            "🚀 *IPO Listing Advisor*\n\n"
+            "You have no stocks in your monitoring list yet.\n"
+            "Add a stock first, then come back here."
+        )
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Stock", callback_data='add_stock')],
+            [InlineKeyboardButton("« Menu", callback_data='menu')]
+        ]
+        if query:
+            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                          parse_mode='Markdown')
+        else:
+            await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                            parse_mode='Markdown')
+        return ConversationHandler.END
+
+    message = (
+        "🚀 *IPO Listing Advisor*\n\n"
+        "Compares a recently-listed stock against DXYZ's post-listing lifecycle "
+        "to identify lifecycle stage, calibrate alerts, and recommend position sizing.\n\n"
+        "Select the stock you want to analyse:"
+    )
+    keyboard = [
+        [InlineKeyboardButton(f"📈 {s['ticker']}  (NAV: ${s.get('nav', 0):.2f})",
+                              callback_data=f"ipostock_{s['id']}")]
+        for s in stocks
+    ]
+    keyboard.append([InlineKeyboardButton("« Cancel", callback_data='menu')])
+
+    if query:
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                      parse_mode='Markdown')
+    else:
+        await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                        parse_mode='Markdown')
+
+    return PRE_IPO_SELECT_STOCK
+
+
+async def ipo_ai_stock_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User picked a stock — show Buy / Sell signal choice."""
+    query = update.callback_query
+    await query.answer()
+
+    stock_id = query.data.replace('ipostock_', '')
+    user_id = get_user_id(update)
+
+    stock = config_manager.get_stock(user_id, stock_id)
+    if not stock:
+        await query.edit_message_text("❌ Stock not found.")
+        return ConversationHandler.END
+
+    context.user_data['ipo_stock_id'] = stock_id
+    ticker = stock['ticker']
+
+    message = (
+        f"🚀 *IPO Listing Advisor — {ticker}*\n\n"
+        "What kind of signal are you looking for?"
+    )
+    keyboard = [
+        [InlineKeyboardButton("📈 Buy Signal",  callback_data='iposignal_buy')],
+        [InlineKeyboardButton("📉 Sell Signal", callback_data='iposignal_sell')],
+        [InlineKeyboardButton("« Back",         callback_data='ipo_advisor')]
+    ]
+    await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard),
+                                  parse_mode='Markdown')
+
+    return PRE_IPO_SELECT_SIGNAL
+
+
+async def ipo_ai_signal_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    User chose Buy or Sell.
+    1. Show loading message immediately.
+    2. Call PreIpoAdvisor in a thread (non-blocking).
+    3. Display result — immediate recommendation or proposed alerts.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    signal_type = "BUY" if query.data == 'iposignal_buy' else "SELL"
+    context.user_data['ipo_signal_type'] = signal_type
+
+    stock_id = context.user_data.get('ipo_stock_id')
+    user_id  = get_user_id(update)
+
+    stock = config_manager.get_stock(user_id, stock_id)
+    if not stock:
+        await query.edit_message_text("❌ Stock not found.")
+        return ConversationHandler.END
+
+    ticker = stock['ticker']
+    nav    = stock.get('nav', 0)
+
+    signal_emoji = "📈" if signal_type == "BUY" else "📉"
+    await query.edit_message_text(
+        f"🚀 *IPO Listing Advisor — {ticker}*\n\n"
+        f"{signal_emoji} Analysing for *{signal_type}* signal...\n"
+        f"📊 Fetching DXYZ lifecycle reference data...\n"
+        f"🔍 Comparing post-listing patterns...\n\n"
+        f"⏳ Please wait, this may take 20–40 seconds.",
+        parse_mode='Markdown'
+    )
+
+    history_data = price_history.load(ticker)
+
+    # Call AI in a thread (non-blocking — keeps the event loop responsive)
+    result = await asyncio.to_thread(
+        pre_ipo_advisor.get_advice, ticker, nav, signal_type, history_data
+    )
+
+    # ── Handle failure ──
+    if not result.get('ok'):
+        error_msg = result.get('error', 'Unknown error')
+        keyboard = [[InlineKeyboardButton("« Menu", callback_data='menu')]]
+        await query.edit_message_text(
+            f"🚀 *IPO Listing Advisor — {ticker}*\n\n"
+            f"❌ Analysis failed:\n{error_msg}\n\n"
+            f"Your existing alerts are unchanged.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    rec_type = result['recommendation_type']
+
+    # ── Common analysis sections (used by both paths) ──
+    summary         = result.get('summary', '')
+    dxyz_pattern    = result.get('dxyz_pattern_analysis', '')
+    lifecycle_stage = result.get('lifecycle_stage', '')
+    news_analysis   = result.get('news_analysis', '')
+    sentiment       = result.get('sentiment_analysis', '')
+    macro           = result.get('macro_analysis', '')
+
+    # ── Position sizing block (SELL required; BUY optional) ──
+    position_block = ""
+    ps = result.get('position_sizing')
+    if ps and isinstance(ps, dict):
+        sell_pct  = ps.get('sell_pct_now', '?')
+        ps_rat    = ps.get('rationale', '')
+        ps_staged = ps.get('staged_approach', '')
+        position_block = (
+            f"\n💰 *Position Sizing Recommendation:*\n"
+            f"Sell *{sell_pct}%* of your position now.\n\n"
+            f"{ps_rat}"
+            + (f"\n\n_{ps_staged}_" if ps_staged else "")
+            + "\n"
+        )
+
+    # Split into primary (DXYZ-core) and supplemental sections so we can
+    # break into two Telegram messages when the combined text exceeds 4096 chars.
+    primary_block = (
+        f"📋 *Summary:*\n{summary}\n\n"
+        f"📊 *DXYZ Pattern Analysis:*\n{dxyz_pattern}\n\n"
+        f"📍 *Lifecycle Stage:*\n{lifecycle_stage}\n"
+        + position_block
+    )
+
+    supplemental_block = (
+        f"\n📰 *Company News:*\n{news_analysis}\n\n"
+        f"💬 *Market Sentiment:*\n{sentiment}\n\n"
+        f"🌐 *Macro:*\n{macro}"
+    )
+
+    analysis_block = primary_block + supplemental_block
+
+    # ── IMMEDIATE recommendation ──
+    if rec_type == 'immediate':
+        action       = result.get('action', signal_type)
+        action_msg   = result.get('message', '')
+        action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(action, "⚪")
+
+        header = (
+            f"🚀 *IPO Listing Advisor — {ticker}* ({signal_type} signal)\n\n"
+            f"{action_emoji} *Recommendation: {action}*\n"
+            f"{action_msg}\n\n"
+        )
+        keyboard = [[InlineKeyboardButton("« Menu", callback_data='menu')]]
+        full_message = header + analysis_block
+
+        if len(full_message) <= 4096:
+            # Fits in a single message
+            await query.edit_message_text(
+                full_message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+        else:
+            # Split: part 1 = header + primary analysis (no buttons)
+            #        part 2 = supplemental sections + menu button
+            msg1 = header + primary_block
+            msg2 = supplemental_block.lstrip('\n')
+            if len(msg1) > 4096:
+                msg1 = msg1[:4080] + "\n_(truncated)_"
+            if len(msg2) > 4096:
+                msg2 = msg2[:4080] + "\n_(truncated)_"
+            await query.edit_message_text(msg1, parse_mode='Markdown')
+            await query.message.reply_text(
+                msg2,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # ── ALERT SUGGESTIONS ──
+    if rec_type == 'alerts':
+        proposed = result.get('alerts', [])
+        context.user_data['ipo_proposed_alerts'] = proposed
+
+        existing_count = len(stock.get('alerts', []))
+
+        watch_alerts  = [a for a in proposed if a['tier'] == 'watch']
+        action_alerts = [a for a in proposed if a['tier'] == 'action']
+
+        def format_alert_line(a):
+            desc = config_manager._generate_description(
+                a['type'], a['operator'], a['threshold']
+            )
+            return f"• {desc}\n  _{a['rationale']}_"
+
+        watch_block = (
+            "\n".join(format_alert_line(a) for a in watch_alerts)
+            if watch_alerts else "  _(none)_"
+        )
+        action_block = (
+            "\n".join(format_alert_line(a) for a in action_alerts)
+            if action_alerts else "  _(none)_"
+        )
+
+        replace_note = (
+            f"⚠️ This will *replace* your current {existing_count} alert(s) for {ticker}."
+            if existing_count > 0
+            else f"ℹ️ This will add {len(proposed)} new alert(s) to {ticker}."
+        )
+
+        header = f"🚀 *IPO Listing Advisor — {ticker}* ({signal_type} signal)\n\n"
+        alerts_section = (
+            f"🔔 *Proposed Alerts:*\n\n"
+            f"👁 *Watch (early warning):*\n{watch_block}\n\n"
+            f"⚡ *Action (strong signal):*\n{action_block}\n\n"
+            f"{replace_note}\n\n"
+            f"Apply these alerts?"
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Yes, Apply Alerts", callback_data='ipoconfirm_yes'),
+                InlineKeyboardButton("❌ Cancel",            callback_data='ipoconfirm_no')
+            ]
+        ]
+
+        full_message = header + analysis_block + "\n\n" + alerts_section
+
+        if len(full_message) <= 4096:
+            # Fits in a single message — send with buttons
+            await query.edit_message_text(
+                full_message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+        else:
+            # Too long — split into two messages:
+            # Part 1: header + analysis (no buttons, user can scroll and read)
+            # Part 2: alerts section with Yes/No buttons
+            msg1 = header + analysis_block
+            msg2 = alerts_section
+
+            # If even part 1 alone is too long, push supplemental into part 2
+            if len(msg1) > 4096:
+                msg1 = header + primary_block
+                msg2 = supplemental_block.lstrip('\n') + "\n\n" + alerts_section
+
+            # Final safety truncation (should rarely trigger)
+            if len(msg1) > 4096:
+                msg1 = msg1[:4080] + "\n_(truncated)_"
+            if len(msg2) > 4096:
+                msg2 = msg2[:4080] + "\n_(truncated)_"
+
+            await query.edit_message_text(msg1, parse_mode='Markdown')
+            await query.message.reply_text(
+                msg2,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+
+        return PRE_IPO_CONFIRM_ALERTS
+
+    # Fallback (should never reach here)
+    await query.edit_message_text("❌ Unexpected AI response type.")
+    return ConversationHandler.END
+
+
+async def ipo_ai_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User confirmed or cancelled the proposed alerts from the IPO advisor."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id  = get_user_id(update)
+    stock_id = context.user_data.get('ipo_stock_id')
+    stock    = config_manager.get_stock(user_id, stock_id)
+    ticker   = stock['ticker'] if stock else "Stock"
+
+    if query.data == 'ipoconfirm_yes':
+        proposed = context.user_data.get('ipo_proposed_alerts', [])
+
+        new_alerts = []
+        for a in proposed:
+            alert_id    = f"alert_{uuid.uuid4().hex[:8]}"
+            description = config_manager._generate_description(
+                a['type'], a['operator'], a['threshold']
+            )
+            new_alerts.append({
+                "id":          alert_id,
+                "type":        a['type'],
+                "operator":    a['operator'],
+                "threshold":   a['threshold'],
+                "description": description,
+                "enabled":     True,
+                "created_at":  datetime.now().isoformat()
+            })
+
+        config_manager.replace_alerts(user_id, stock_id, new_alerts)
+        alert_state_manager.clear_stock_alert_states(user_id, stock_id)
+
+        lines = "\n".join(f"  {i+1}. {a['description']}"
+                          for i, a in enumerate(new_alerts))
+        message = (
+            f"✅ *Alerts Updated for {ticker}!*\n\n"
+            f"*New alert set ({len(new_alerts)} alert(s)):*\n"
+            f"{lines}\n\n"
+            f"The monitor will start checking these on the next cycle."
+        )
+        keyboard = [
+            [InlineKeyboardButton(f"🔔 View {ticker} Alerts", callback_data=f'alerts_{stock_id}')],
+            [InlineKeyboardButton("« Menu", callback_data='menu')]
+        ]
+
+    else:  # ipoconfirm_no
+        message = (
+            f"❌ *Cancelled*\n\n"
+            f"Your existing alerts for {ticker} are unchanged."
+        )
+        keyboard = [[InlineKeyboardButton("« Menu", callback_data='menu')]]
+
+    # Strip buttons from analysis message so it stays readable in history;
+    # send confirmation as a NEW message below (same pattern as ask_ai_confirm)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await query.message.reply_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
 # ========== HELP & MISC HANDLERS ==========
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1589,6 +1990,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await check_status_now(update, context)
     elif query.data == 'ask_ai':
         await ask_ai_start(update, context)
+    elif query.data == 'ipo_advisor':
+        await ipo_ai_start(update, context)
     elif query.data.startswith('stock_'):
         await stock_detail(update, context)
     elif query.data.startswith('alerts_'):
@@ -1612,7 +2015,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot"""
-    global ai_advisor
+    global ai_advisor, pre_ipo_advisor
 
     try:
         with open('config.json', 'r') as f:
@@ -1629,9 +2032,13 @@ def main():
     if openrouter_key and openrouter_key != "YOUR_OPENROUTER_API_KEY_HERE":
         ai_advisor = AIAdvisor(openrouter_key)
         print("🤖 AI Advisor: enabled (Openrouter key loaded)")
+        pre_ipo_advisor = PreIpoAdvisor(openrouter_key)
+        print("🚀 IPO Listing Advisor: enabled (DXYZ lifecycle analysis)")
     else:
         ai_advisor = None
+        pre_ipo_advisor = None
         print("🤖 AI Advisor: disabled (no Openrouter API key in config.json)")
+        print("🚀 IPO Listing Advisor: disabled (no Openrouter API key in config.json)")
 
     application = Application.builder().token(bot_token).build()
     application.post_init = setup_commands
@@ -1700,6 +2107,20 @@ def main():
         allow_reentry=True
     )
 
+    ipo_ai_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(ipo_ai_start, pattern='^ipo_advisor$'),
+            CommandHandler('ipoai', ipo_ai_start),
+        ],
+        states={
+            PRE_IPO_SELECT_STOCK:   [CallbackQueryHandler(ipo_ai_stock_selected,  pattern='^ipostock_')],
+            PRE_IPO_SELECT_SIGNAL:  [CallbackQueryHandler(ipo_ai_signal_selected, pattern='^iposignal_')],
+            PRE_IPO_CONFIRM_ALERTS: [CallbackQueryHandler(ipo_ai_confirm,         pattern='^ipoconfirm_')],
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command)],
+        allow_reentry=True
+    )
+
     # Add handlers
     # ConversationHandlers must be registered before the catch-all button_callback
     application.add_handler(CommandHandler('start', start))
@@ -1712,6 +2133,7 @@ def main():
     application.add_handler(delete_alert_conv)
     application.add_handler(nav_conv)
     application.add_handler(heartbeat_conv)
+    application.add_handler(ipo_ai_conv)
     application.add_handler(ask_ai_conv)
 
     application.add_handler(CallbackQueryHandler(button_callback))
