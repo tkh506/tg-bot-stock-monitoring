@@ -197,6 +197,7 @@ Description=Stock Monitor Config Bot
 After=network.target
 
 [Service]
+Environment="PYTHONUNBUFFERED=1"
 User=<your-username>
 WorkingDirectory=/home/<your-username>/tg-bot-stock-monitoring
 ExecStart=/usr/bin/python3 /home/<your-username>/tg-bot-stock-monitoring/telegram_bot_multistock.py
@@ -223,6 +224,7 @@ Description=Stock Monitor Background Bot
 After=network.target
 
 [Service]
+Environment="PYTHONUNBUFFERED=1"
 User=<your-username>
 WorkingDirectory=/home/<your-username>/tg-bot-stock-monitoring
 ExecStart=/usr/bin/python3 /home/<your-username>/tg-bot-stock-monitoring/robo_monitor_multistock.py
@@ -256,7 +258,56 @@ Both should show `active (running)`. Open Telegram and send `/start` to your bot
 
 ## Part 5: Updating the Bot
 
-### On your local machine
+**Always dry-run locally before pushing. Pushing broken code restarts the VM services and takes down the production bot for all users.**
+
+The safe update workflow is:
+
+```
+Code change → dry-run locally → confirm it works → git push → VM git pull + restart
+```
+
+---
+
+### Step 5.1: Dry-run locally in PyCharm
+
+Use a **separate test bot token** so you never conflict with the production bot running on the VM.
+(Running two instances on the same token causes duplicate messages — see LESSONS.md #10.)
+
+**How to create a test bot token:**
+1. Open Telegram → search for `@BotFather`
+2. Send `/newbot`, pick a test name (e.g. `MyBot_Dev`)
+3. Copy the token BotFather gives you
+
+**How to run locally in PyCharm:**
+
+1. Open the project in PyCharm (File → Open → select project folder)
+2. Make sure the virtual environment and dependencies are set up (see Part 0 if not done yet)
+3. Open `config.json` and temporarily paste your **test bot token** (not the production one)
+4. Open two terminal tabs at the bottom of PyCharm:
+
+   **Terminal 1 — Config bot:**
+   ```bash
+   python telegram_bot_multistock.py
+   ```
+
+   **Terminal 2 — Monitor bot (optional, only if testing monitor logic):**
+   ```bash
+   python robo_monitor_multistock.py
+   ```
+
+5. Open Telegram, find your **test bot**, send `/start` and test the new feature
+6. Watch the PyCharm terminal for any errors or unexpected output
+7. Press **Ctrl+C** to stop when done
+
+> After testing, restore `config.json` to its original state (or just leave it with the test token — the production `config.json` lives only on the VM and is never affected by local changes).
+
+Once you're satisfied the change works correctly, proceed to Step 5.2.
+
+---
+
+### Step 5.2: Commit and push to GitHub
+
+On your local machine:
 
 ```bash
 git add .
@@ -264,7 +315,7 @@ git commit -m "describe your change"
 git push
 ```
 
-### On the VM
+### Step 5.3: Deploy to the VM
 
 ```bash
 cd ~/tg-bot-stock-monitoring

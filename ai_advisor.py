@@ -15,7 +15,7 @@ from datetime import datetime
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-AI_MODEL       = "anthropic/claude-sonnet-4-5"   # Openrouter model ID for Claude Sonnet
+AI_MODEL       = "openai/gpt-5-mini"          # Openrouter model ID for DeepSeek V3.2
 AI_TIMEOUT     = 90  # seconds — generous timeout; analysis can take 20–40 s
 
 # Alert types the bot supports
@@ -64,6 +64,162 @@ class AIAdvisor:
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+
+    # ── Sentiment helpers ───────────────────────
+
+    def _get_stocktwits_sentiment(self, ticker: str) -> dict:
+        """
+        Fetch retail sentiment from StockTwits.
+        Applied to all tickers; HK tickers will often return 0 messages — that
+        itself is useful signal (low retail coverage on English-language platforms).
+        """
+        try:
+            # StockTwits uses the ticker without exchange suffix
+            st_ticker = ticker.replace(".HK", "").upper()
+            url = f"https://api.stocktwits.com/api/2/streams/symbol/{st_ticker}.json"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                return {}
+            messages = resp.json().get("messages", [])
+            if not messages:
+                return {"total_messages": 0, "bullish": 0, "bearish": 0,
+                        "sentiment_ratio": "no messages found", "samples": []}
+
+            bullish, bearish = 0, 0
+            samples = []
+            for msg in messages[:30]:
+                sentiment = (msg.get("entities") or {}).get("sentiment") or {}
+                basic = sentiment.get("basic", "")
+                if basic == "Bullish":
+                    bullish += 1
+                elif basic == "Bearish":
+                    bearish += 1
+                body = (msg.get("body") or "").strip()
+                if body and len(samples) < 5:
+                    label = f" [{basic}]" if basic else ""
+                    samples.append(f'"{body[:120]}"{label}')
+
+            total_with_sentiment = bullish + bearish
+            ratio = (f"{bullish}/{total_with_sentiment} bullish"
+                     if total_with_sentiment else "no sentiment labels")
+            return {
+                "total_messages": len(messages),
+                "bullish": bullish,
+                "bearish": bearish,
+                "sentiment_ratio": ratio,
+                "samples": samples,
+            }
+        except Exception as e:
+            print(f"[AIAdvisor] StockTwits fetch failed for {ticker}: {e}")
+            return {}
+
+    def _get_google_trends(self, ticker: str, company_name: str = "") -> dict:
+        """
+        Fetch Google search interest trend (3 months, weekly).
+        Tries the raw ticker first; falls back to company name if no data.
+        Note: pytrends may be blocked on some cloud VMs — fails silently.
+        """
+        try:
+            from pytrends.request import TrendReq
+            pt = TrendReq(hl="en-US", tz=0, timeout=(10, 25))
+
+            keywords_to_try = [ticker]
+            if company_name and company_name != ticker:
+                keywords_to_try.append(company_name[:50])
+
+            for keyword in keywords_to_try:
+                try:
+                    pt.build_payload([keyword], timeframe="today 3-m", geo="")
+                    df = pt.interest_over_time()
+                    if df is None or df.empty or keyword not in df.columns:
+                        continue
+                    values = [int(v) for v in df[keyword].tolist()]
+                    if sum(values) == 0:
+                        continue  # No data for this keyword — try next
+
+                    recent_avg = sum(values[-4:]) / 4 if len(values) >= 4 else sum(values) / len(values)
+                    older_avg  = sum(values[-8:-4]) / 4 if len(values) >= 8 else None
+                    if older_avg and older_avg > 0:
+                        trend_pct = ((recent_avg - older_avg) / older_avg) * 100
+                        trend_dir = ("rising ↑" if trend_pct > 10
+                                     else "falling ↓" if trend_pct < -10
+                                     else "stable →")
+                        trend_str = f"{trend_pct:+.0f}% ({trend_dir})"
+                    else:
+                        trend_str = "insufficient history"
+
+                    return {
+                        "keyword_used":    keyword,
+                        "current_interest": round(recent_avg, 1),
+                        "trend_4w":        trend_str,
+                        "peak_3m":         max(values),
+                        "weekly_values":   values[-12:],  # last 12 weeks for context
+                    }
+                except Exception as e:
+                    print(f"[AIAdvisor] Google Trends failed for '{keyword}': {e}")
+                    continue
+
+            return {}
+        except ImportError:
+            print("[AIAdvisor] pytrends not installed — run: pip install pytrends")
+            return {}
+        except Exception as e:
+            print(f"[AIAdvisor] Google Trends fetch failed for {ticker}: {e}")
+            return {}
+
+    def _get_reddit_sentiment(self, ticker: str) -> dict:
+        """
+        Fetch Reddit post sentiment using the public .json endpoint — no API key needed.
+        Searches ticker-specific posts across r/investing, r/stocks, r/wallstreetbets.
+        Skipped entirely for HK tickers (.HK) — Reddit coverage is too thin to be useful.
+        Fails silently if Reddit blocks the VM (short 5s timeout per subreddit).
+        """
+        # HK tickers have near-zero Reddit coverage — skip entirely
+        if ticker.upper().endswith(".HK"):
+            return {"skipped": True, "reason": "HK ticker — insufficient Reddit coverage"}
+
+        try:
+            subreddits = ["investing", "stocks", "wallstreetbets"]
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; StockMonitorBot/1.0; personal use)"
+            }
+            all_posts = []
+
+            for sub in subreddits:
+                try:
+                    url = (f"https://www.reddit.com/r/{sub}/search.json"
+                           f"?q={ticker}&sort=new&limit=5&restrict_sr=1")
+                    resp = requests.get(url, headers=headers, timeout=5)
+                    if resp.status_code != 200:
+                        continue
+                    children = resp.json().get("data", {}).get("children", [])
+                    for post in children:
+                        d = post.get("data", {})
+                        title = (d.get("title") or "").strip()
+                        if not title:
+                            continue
+                        all_posts.append({
+                            "subreddit":    sub,
+                            "title":        title[:150],
+                            "score":        d.get("score", 0),
+                            "upvote_ratio": round(d.get("upvote_ratio", 0), 2),
+                            "num_comments": d.get("num_comments", 0),
+                        })
+                except Exception as e:
+                    print(f"[AIAdvisor] Reddit fetch failed for r/{sub}: {e}")
+                    continue
+
+            if not all_posts:
+                return {"total_posts": 0, "posts": [],
+                        "note": "No ticker-specific posts found on Reddit"}
+
+            # Sort by score, keep top 10 across all subreddits
+            all_posts.sort(key=lambda x: x["score"], reverse=True)
+            return {"total_posts": len(all_posts), "posts": all_posts[:10]}
+
+        except Exception as e:
+            print(f"[AIAdvisor] Reddit sentiment fetch failed for {ticker}: {e}")
+            return {}
 
     # ── 1. Context preparation ──────────────────
 
@@ -212,7 +368,7 @@ class AIAdvisor:
         news_headlines = []
         try:
             raw_news = getattr(stock_obj, "news", None) or []
-            for item in raw_news[:5]:
+            for item in raw_news[:15]:
                 title = ((item.get("content", {}) or {}).get("title")
                          or item.get("title", ""))
                 pub   = (item.get("content", {}) or {}).get("provider", {})
@@ -248,6 +404,13 @@ class AIAdvisor:
         except Exception as e:
             print(f"[AIAdvisor] Stock info fetch failed for {ticker}: {e}")
 
+        # ── Retail sentiment (StockTwits, Google Trends, Reddit) ──
+        company_name = stock_info.get("longName", "")
+        print(f"[AIAdvisor] Fetching retail sentiment for {ticker}...")
+        stocktwits_data = self._get_stocktwits_sentiment(ticker)
+        google_trends   = self._get_google_trends(ticker, company_name)
+        reddit_data     = self._get_reddit_sentiment(ticker)
+
         return {
             "ticker":           ticker,
             "nav":              nav,
@@ -277,6 +440,9 @@ class AIAdvisor:
             "benchmark_ticker": benchmark_ticker,
             "benchmark_1y_pct": benchmark_1y_pct,
             "stock_info":       stock_info,
+            "stocktwits":       stocktwits_data,
+            "google_trends":    google_trends,
+            "reddit":           reddit_data,
             "analysis_time":    datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
         }
 
@@ -355,6 +521,50 @@ class AIAdvisor:
         info_lines = "\n".join(f"  {k}: {v}"
                                for k, v in ctx["stock_info"].items()) or "  (N/A)"
 
+        # ── Retail sentiment ──
+        # StockTwits
+        st = ctx["stocktwits"]
+        if st:
+            st_line = (f"Messages fetched: {st['total_messages']} | "
+                       f"Sentiment: {st['sentiment_ratio']}")
+            samples_text = "\n".join(f"    {s}" for s in st.get("samples", []))
+            stocktwits_block = (f"StockTwits ({ctx['ticker'].replace('.HK','')})\n"
+                                f"  {st_line}"
+                                + (f"\n  Sample messages:\n{samples_text}" if samples_text else ""))
+        else:
+            stocktwits_block = "StockTwits: fetch failed or unavailable"
+
+        # Google Trends
+        gt = ctx["google_trends"]
+        if gt:
+            gt_block = (
+                f"Google Trends (keyword: '{gt['keyword_used']}'):\n"
+                f"  Current interest: {gt['current_interest']}/100  |  "
+                f"4-week trend: {gt['trend_4w']}  |  "
+                f"3-month peak: {gt['peak_3m']}/100"
+            )
+        else:
+            gt_block = "Google Trends: no data (pytrends unavailable or blocked)"
+
+        # Reddit
+        rd = ctx.get("reddit", {})
+        if rd.get("skipped"):
+            reddit_block = f"Reddit: skipped ({rd.get('reason', 'HK ticker')})"
+        elif not rd or rd.get("total_posts", 0) == 0:
+            reddit_block = "Reddit: no ticker-specific posts found (or fetch blocked)"
+        else:
+            post_lines = "\n".join(
+                f"  [{p['subreddit']}] {p['title']}  "
+                f"(score: {p['score']}, upvotes: {int(p['upvote_ratio']*100)}%, "
+                f"comments: {p['num_comments']})"
+                for p in rd["posts"]
+            )
+            reddit_block = (
+                f"Reddit (r/investing + r/stocks + r/wallstreetbets) — "
+                f"{rd['total_posts']} recent posts found, top {len(rd['posts'])} shown:\n"
+                + post_lines
+            )
+
         # ── Premium history (only if NAV applicable) ──
         premium_section = ""
         if ctx["nav_applicable"] and ctx["premium_history"]:
@@ -409,8 +619,17 @@ MARKET CONTEXT
 ════════════════════════════════
 {bm_block}
 
-Recent news:
+Recent news (up to 15 headlines):
 {news_block}
+
+════════════════════════════════
+RETAIL SENTIMENT
+════════════════════════════════
+{stocktwits_block}
+
+{gt_block}
+
+{reddit_block}
 
 ════════════════════════════════
 12-MONTH PRICE SUMMARY (end-of-month close, {ctx['data_days']} trading days of data)
@@ -456,14 +675,22 @@ FORMAT A — Conditions already clearly met (act now):
   "recommendation_type": "immediate",
   "action": "{ctx['signal_type']}",
   "summary": "2–3 sentences: current situation and why immediate action",
-  "reasoning": "Full analysis: trend, momentum, volume, premium (if applicable), market context, news, risks"
+  "price_analysis": "Price movement, volume, SMA cross, 52-week range, momentum — what the chart is saying",
+  "sector_analysis": "Sector/industry context, ETF composition or peer comparison if relevant. Write 'N/A' if no useful sector data available.",
+  "news_analysis": "2–3 sentences on the most relevant recent news headlines for this specific stock and their likely impact",
+  "sentiment_analysis": "2–3 sentences covering StockTwits bullish/bearish ratio, Reddit post tone, and Google Trends interest level and direction",
+  "macro_analysis": "Macro factors affecting this stock: economy, interest rates, geopolitics, government policy, currency"
 }}
 
 FORMAT B — Set up monitoring alerts (wait for the signal):
 {{
   "recommendation_type": "alerts",
   "summary": "2–3 sentences: current situation and what to watch for",
-  "reasoning": "Full analysis: trend, momentum, volume, premium (if applicable), market context, news, risks",
+  "price_analysis": "Price movement, volume, SMA cross, 52-week range, momentum — what the chart is saying",
+  "sector_analysis": "Sector/industry context, ETF composition or peer comparison if relevant. Write 'N/A' if no useful sector data available.",
+  "news_analysis": "2–3 sentences on the most relevant recent news headlines for this specific stock and their likely impact",
+  "sentiment_analysis": "2–3 sentences covering StockTwits bullish/bearish ratio, Reddit post tone, and Google Trends interest level and direction",
+  "macro_analysis": "Macro factors affecting this stock: economy, interest rates, geopolitics, government policy, currency",
   "alerts": [
     {{
       "type": "price_1d | price_7d | premium | volume",
@@ -480,7 +707,7 @@ Alert tier definitions:
   "action" — stronger threshold, high-confidence signal, fires on conviction
 
 Rules for alert design:
-  - Provide 2 to 4 alerts total; use a mix of tiers
+  - Provide 2 to 6 alerts total; use a mix of tiers
   - Calibrate thresholds to this stock's actual recent volatility (check the data!)
   - Prefer diverse types (e.g. mix 1 price + 1 volume rather than all price)
   - Do NOT suggest "premium" alerts if NAV is not applicable
@@ -506,7 +733,7 @@ Return ONLY valid JSON — no markdown fences, no comments, no text outside the 
             "model": AI_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
-            "max_tokens": 1500,
+            "max_tokens": 4000,
         }
         response = requests.post(OPENROUTER_URL, headers=headers,
                                  json=payload, timeout=AI_TIMEOUT)
@@ -525,6 +752,13 @@ Return ONLY valid JSON — no markdown fences, no comments, no text outside the 
         except (KeyError, IndexError) as e:
             raise ValueError(f"Unexpected API response structure: {e}")
 
+        # Guard: response truncated by token limit
+        finish_reason = raw_response.get("choices", [{}])[0].get("finish_reason", "")
+        if finish_reason == "length":
+            print(f"[AIAdvisor] Response truncated (finish_reason=length). "
+                  f"Increase max_tokens. Partial content:\n{content}")
+            raise ValueError("AI response was cut off (token limit reached). Please try again.")
+
         # Guard: empty content (can happen if model refused or returned nothing)
         if not content or not content.strip():
             print(f"[AIAdvisor] Empty content in API response. "
@@ -540,8 +774,17 @@ Return ONLY valid JSON — no markdown fences, no comments, no text outside the 
             inner_lines = lines[1:] if lines[-1].strip() == "```" else lines[1:-1]
             stripped = "\n".join(inner_lines).strip()
 
+        # Find the start of the JSON object (skip any leading non-JSON text)
+        json_start = stripped.find("{")
+        if json_start == -1:
+            print(f"[AIAdvisor] No JSON object found. Raw content was:\n{content}")
+            raise ValueError("AI response contained no JSON object.")
+        stripped = stripped[json_start:]
+
         try:
-            result = json.loads(stripped)
+            # raw_decode parses the first complete JSON object and ignores
+            # any trailing text (e.g. extra explanation after the closing })
+            result, _ = json.JSONDecoder().raw_decode(stripped)
         except json.JSONDecodeError as e:
             print(f"[AIAdvisor] JSON parse failed. Raw content was:\n{content}")
             raise ValueError(f"AI returned invalid JSON: {e}")
@@ -553,13 +796,16 @@ Return ONLY valid JSON — no markdown fences, no comments, no text outside the 
                 "Expected 'immediate' or 'alerts'."
             )
 
+        analysis_fields = ("price_analysis", "sector_analysis", "news_analysis",
+                            "sentiment_analysis", "macro_analysis")
+
         if rec_type == "immediate":
-            for field in ("action", "summary", "reasoning"):
+            for field in ("action", "summary") + analysis_fields:
                 if not result.get(field):
                     raise ValueError(f"Missing field '{field}' in immediate response")
 
         elif rec_type == "alerts":
-            for field in ("summary", "reasoning", "alerts"):
+            for field in ("summary", "alerts") + analysis_fields:
                 if not result.get(field):
                     raise ValueError(f"Missing field '{field}' in alerts response")
 

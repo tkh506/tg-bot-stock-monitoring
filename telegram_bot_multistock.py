@@ -306,10 +306,13 @@ def get_stock_data(ticker):
 
 async def setup_commands(application):
     commands = [
-        BotCommand("start", "Main menu"),
-        BotCommand("stocks", "View all stocks"),
-        BotCommand("addstock", "Add new stock"),
-        BotCommand("help", "Show help"),
+        BotCommand("start",     "Main menu"),
+        BotCommand("stocks",    "View all stocks"),
+        BotCommand("addstock",  "Add new stock"),
+        BotCommand("status",    "Check all stock prices now"),
+        BotCommand("askai",     "Ask AI for stock advice"),
+        BotCommand("heartbeat", "Set heartbeat frequency"),
+        BotCommand("help",      "Show help"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -358,13 +361,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_status_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check status of all stocks immediately"""
+    """Check status of all stocks immediately — works from both callback and /status command."""
     query = update.callback_query
-    await query.answer()
+    if query:
+        await query.answer()
 
     user_id = get_user_id(update)
     config = config_manager.load(user_id)
     stocks = config.get('stocks', [])
+
+    async def send(text, reply_markup=None):
+        """Send or edit a message depending on whether we came from a callback or a command."""
+        if query:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
     if not stocks:
         message = (
@@ -376,16 +387,12 @@ async def check_status_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➕ Add Stock", callback_data='add_stock')],
             [InlineKeyboardButton("« Menu", callback_data='menu')]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            message,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
+        await send(message, InlineKeyboardMarkup(keyboard))
         return
 
-    # Show processing message
-    await query.edit_message_text("🔍 Fetching live prices...", parse_mode='Markdown')
+    # Show processing message (callback only — avoids a dangling message on command path)
+    if query:
+        await query.edit_message_text("🔍 Fetching live prices...", parse_mode='Markdown')
 
     hk_tz = pytz.timezone('Asia/Hong_Kong')
     now_hk = datetime.now(hk_tz).strftime('%Y-%m-%d %H:%M:%S HKT')
@@ -440,13 +447,7 @@ async def check_status_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message += "🔄 Live status retrieved"
 
     keyboard = [[InlineKeyboardButton("« Menu", callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        message,
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
+    await send(message, InlineKeyboardMarkup(keyboard))
 
 
 async def list_stocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1140,9 +1141,10 @@ async def remove_stock_confirmed(update: Update, context: ContextTypes.DEFAULT_T
 # ========== HEARTBEAT HANDLER ==========
 
 async def update_heartbeat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Update heartbeat frequency"""
+    """Update heartbeat frequency — works from both callback and /heartbeat command."""
     query = update.callback_query
-    await query.answer()
+    if query:
+        await query.answer()
 
     user_id = get_user_id(update)
     config = config_manager.load(user_id)
@@ -1156,9 +1158,14 @@ async def update_heartbeat_start(update: Update, context: ContextTypes.DEFAULT_T
         f"💬 Type number or /cancel"
     )
 
-    await query.message.delete()
+    if query:
+        await query.message.delete()
+        chat_id = query.message.chat_id
+    else:
+        chat_id = update.message.chat_id
+
     await context.bot.send_message(
-        chat_id=query.message.chat_id,
+        chat_id=chat_id,
         text=message,
         parse_mode='Markdown'
     )
@@ -1354,16 +1361,24 @@ async def ask_ai_signal_selected(update: Update, context: ContextTypes.DEFAULT_T
 
     # ── IMMEDIATE recommendation ──
     if rec_type == 'immediate':
-        action  = result.get('action', signal_type)
-        summary = result.get('summary', '')
-        reasoning = result.get('reasoning', '')
+        action           = result.get('action', signal_type)
+        summary          = result.get('summary', '')
+        price_analysis   = result.get('price_analysis', '')
+        sector_analysis  = result.get('sector_analysis', '')
+        news_analysis    = result.get('news_analysis', '')
+        sentiment        = result.get('sentiment_analysis', '')
+        macro            = result.get('macro_analysis', '')
 
         action_emoji = "🟢" if action == "BUY" else "🔴"
         message = (
             f"🤖 *AI Advisor — {ticker}*\n\n"
             f"{action_emoji} *Recommendation: {action} NOW*\n\n"
-            f"📊 *Summary:*\n{summary}\n\n"
-            f"🔍 *Analysis:*\n{reasoning}"
+            f"📋 *Summary:*\n{summary}\n\n"
+            f"📈 *Stock Price & Volume:*\n{price_analysis}\n\n"
+            f"🏭 *Sector:*\n{sector_analysis}\n\n"
+            f"📰 *Company News:*\n{news_analysis}\n\n"
+            f"💬 *Market Sentiment:*\n{sentiment}\n\n"
+            f"🌐 *Macro:*\n{macro}"
         )
 
         # Telegram has a 4096 char limit per message — trim reasoning if needed
@@ -1381,8 +1396,13 @@ async def ask_ai_signal_selected(update: Update, context: ContextTypes.DEFAULT_T
 
     # ── ALERT SUGGESTIONS ──
     if rec_type == 'alerts':
-        proposed = result.get('alerts', [])
-        summary  = result.get('summary', '')
+        proposed         = result.get('alerts', [])
+        summary          = result.get('summary', '')
+        price_analysis   = result.get('price_analysis', '')
+        sector_analysis  = result.get('sector_analysis', '')
+        news_analysis    = result.get('news_analysis', '')
+        sentiment        = result.get('sentiment_analysis', '')
+        macro            = result.get('macro_analysis', '')
 
         # Store for the confirmation step
         context.user_data['ai_proposed_alerts'] = proposed
@@ -1417,7 +1437,12 @@ async def ask_ai_signal_selected(update: Update, context: ContextTypes.DEFAULT_T
 
         message = (
             f"🤖 *AI Advisor — {ticker}* ({signal_type} signal)\n\n"
-            f"📊 *Summary:*\n{summary}\n\n"
+            f"📋 *Summary:*\n{summary}\n\n"
+            f"📈 *Stock Price & Volume:*\n{price_analysis}\n\n"
+            f"🏭 *Sector:*\n{sector_analysis}\n\n"
+            f"📰 *Company News:*\n{news_analysis}\n\n"
+            f"💬 *Market Sentiment:*\n{sentiment}\n\n"
+            f"🌐 *Macro:*\n{macro}\n\n"
             f"🔔 *Proposed Alerts:*\n\n"
             f"👁 *Watch (early warning):*\n{watch_block}\n\n"
             f"⚡ *Action (strong signal):*\n{action_block}\n\n"
@@ -1501,7 +1526,14 @@ async def ask_ai_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         keyboard = [[InlineKeyboardButton("« Menu", callback_data='menu')]]
 
-    await query.edit_message_text(
+    # Remove the Yes/No buttons from the analysis message so it stays readable,
+    # then send the confirmation as a NEW message so the analysis is preserved.
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass  # If edit fails (e.g. message too old), just proceed
+
+    await query.message.reply_text(
         message,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
@@ -1645,14 +1677,20 @@ def main():
     )
 
     heartbeat_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(update_heartbeat_start, pattern='^update_heartbeat$')],
+        entry_points=[
+            CallbackQueryHandler(update_heartbeat_start, pattern='^update_heartbeat$'),
+            CommandHandler('heartbeat', update_heartbeat_start),
+        ],
         states={UPDATE_HEARTBEAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_heartbeat_entered)]},
         fallbacks=[CommandHandler('cancel', cancel_command)],
         allow_reentry=True
     )
 
     ask_ai_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(ask_ai_start, pattern='^ask_ai$')],
+        entry_points=[
+            CallbackQueryHandler(ask_ai_start, pattern='^ask_ai$'),
+            CommandHandler('askai', ask_ai_start),
+        ],
         states={
             AI_SELECT_STOCK:   [CallbackQueryHandler(ask_ai_stock_selected,  pattern='^aistock_')],
             AI_SELECT_SIGNAL:  [CallbackQueryHandler(ask_ai_signal_selected, pattern='^aisignal_')],
@@ -1666,6 +1704,7 @@ def main():
     # ConversationHandlers must be registered before the catch-all button_callback
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('stocks', list_stocks))
+    application.add_handler(CommandHandler('status', check_status_now))
     application.add_handler(CommandHandler('help', help_command))
 
     application.add_handler(add_stock_conv)

@@ -60,16 +60,26 @@ price_history/history_{ticker}.json  # 30-day price history per ticker
 - All stock/alert management via inline keyboard buttons
 
 ### AI Advisor Feature (`ask_ai` flow)
-- Entry: "🤖 Ask AI Advice" button on main menu
+- Entry: "🤖 Ask AI Advice" button on main menu, or `/askai` command
 - User selects stock → Buy or Sell signal
-- Bot calls Claude Sonnet via Openrouter API (in `asyncio.to_thread` — non-blocking)
-- AI analyses: 30-day local price history + yfinance news + benchmark (SPY/^HSI) + stock info
+- Bot calls LLM via Openrouter API (in `asyncio.to_thread` — non-blocking)
+- Model configured via `AI_MODEL` constant in `ai_advisor.py` (currently `deepseek/deepseek-v3.2`; swap freely)
+- `max_tokens = 4000` — needed for verbose models (GPT-5 mini, DeepSeek); lower models may truncate at 1500
+- AI analyses: **1-year daily OHLCV from yfinance** (52w range, 20/50/200-day SMA, price changes 1d–1y, volume stats, annualised volatility, monthly summary, recent 60-day OHLCV) + yfinance news (up to 15 headlines) + benchmark return (SPY/^HSI) + stock info + local premium history (if NAV applicable) + retail sentiment (StockTwits, Google Trends, Reddit)
+- **Retail sentiment sources** (all no-auth, fail silently):
+  - StockTwits: `api.stocktwits.com` — bullish/bearish counts + sample messages
+  - Google Trends: via `pytrends` — search interest level + 4-week trend
+  - Reddit: public `.json` endpoint — ticker search across r/investing, r/stocks, r/wallstreetbets; skipped for HK tickers
 - AI returns either:
   - `immediate` → display recommendation message, no alert changes
-  - `alerts` → display two-tier (watch/action) alert proposals, ask for confirmation
+  - `alerts` → display two-tier (watch/action) alert proposals (2–6 alerts), ask for confirmation
+- **Response JSON has 5 analysis sections**: `price_analysis`, `sector_analysis`, `news_analysis`, `sentiment_analysis`, `macro_analysis` — plus `summary` and optionally `alerts`
+- On confirm/decline: **analysis message is preserved** in chat; confirmation result sent as a new message below
 - On confirm: `replace_alerts()` atomically replaces all alerts; `clear_stock_alert_states()` purges stale states
 - Module: `ai_advisor.py` — `AIAdvisor` class, all AI logic isolated here
 - Configured via `config.json` → `openrouter.api_key`; bot works normally if key is absent
+- **API note**: do NOT use `response_format: json_object` with Openrouter + Claude — it is OpenAI-specific and causes empty content responses; rely on prompt instruction instead
+- **Truncation guard**: `parse_and_validate()` checks `finish_reason == "length"` and raises a clear error if response was cut off
 
 ## Dependencies
 ```

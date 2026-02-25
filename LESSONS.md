@@ -146,3 +146,83 @@ Fix: detect sparse history (fewer than 2 entries) and seed it upfront using `yf.
 When generating a natural-language description for an alert (e.g. "Drops >2.5% in 1 day"), it is tempting to key only on the threshold sign. But the operator matters too. `operator='>'` with `threshold=-2.5` means "triggers when change > -2.5%" — which fires almost always and is not a drop alert at all.
 
 Always derive descriptions from the *combination* of operator and threshold. Fall back to showing the explicit condition (`1D change > -2.5%`) for unusual combinations rather than generating a misleading natural-language label.
+
+---
+
+### 14. Never push to git or deploy to the VM before the user has dry-run locally
+
+After making code changes, **always stop at the local commit step**. Do not run `git push` or SSH to the VM to restart services until the user has:
+1. Tested the change locally (e.g. via a test bot token)
+2. Confirmed it works as expected
+3. Explicitly asked to push and deploy
+
+Pushing broken code to the VM takes down the production bot for all users. The correct workflow is:
+
+```
+Code change → git commit (local only) → user dry-runs locally → user confirms → git push → VM git pull + systemctl restart
+```
+
+---
+
+### 15. Openrouter + Claude: do not use `response_format: json_object`
+
+`"response_format": {"type": "json_object"}` is an **OpenAI-specific** API parameter. When sent to Claude models via Openrouter, it causes the `content` field in the response to be an empty string — no error is raised, the HTTP status is 200, but `content` is `""`. `json.loads("")` then fails with `Expecting value: line 1 column 1 (char 0)`.
+
+Fix: remove `response_format` from the payload entirely. Instead, instruct the model in the prompt to return only valid JSON (e.g. `"Return ONLY valid JSON — no markdown fences, no comments, no text outside the JSON object."`). Claude reliably follows this instruction.
+
+---
+
+### 17. Verbose LLMs need higher `max_tokens` — and a `finish_reason` guard
+
+Different models have very different output verbosity. GPT-5 mini and DeepSeek V3.x generate significantly more tokens per response than older models like Claude Haiku or GPT-4o mini. A `max_tokens` value that worked fine for one model may silently truncate another mid-JSON, producing `Unterminated string` parse errors.
+
+Rules:
+- Set `max_tokens` generously (4000+) for modern frontier models
+- Always check `finish_reason` before parsing — if it equals `"length"`, the response was cut off and JSON parsing will fail; raise a clear error and log the partial content
+
+```python
+finish_reason = raw_response.get("choices", [{}])[0].get("finish_reason", "")
+if finish_reason == "length":
+    raise ValueError("AI response was cut off (token limit reached). Please try again.")
+```
+
+---
+
+### 18. Reddit `.json` trick: free sentiment data, but with real limitations
+
+Every Reddit page can be accessed as raw JSON by appending `.json` to the URL. For ticker-specific sentiment, use the search endpoint:
+
+```
+https://www.reddit.com/r/stocks/search.json?q=TICKER&sort=new&limit=5&restrict_sr=1
+```
+
+No API key or account needed. Key limitations:
+- **HK tickers**: near-zero coverage — skip entirely for `.HK` tickers
+- **Cloud VMs**: Reddit may rate-limit or block requests from cloud IP ranges; always wrap in `try/except` with a short timeout (5s)
+- **Relevance**: only popular US stocks have meaningful post volume; ETFs and small caps may return 0 results
+- **User-Agent**: include a descriptive `User-Agent` header to reduce blocking risk
+
+---
+
+### 19. Structured output sections force the AI to engage with each data source
+
+A single `"reasoning"` field in the AI JSON response gives the model freedom to ignore inconvenient data (e.g. skipping sentiment if it seems noisy). Splitting the response into explicit named sections (`price_analysis`, `sector_analysis`, `news_analysis`, `sentiment_analysis`, `macro_analysis`) forces the model to populate each one, ensuring it actively processes every data category.
+
+Side benefit: the user sees clearly organised output in Telegram, making it easier to spot which factor drove the recommendation.
+
+---
+
+### 16. Use `raw_decode()` instead of `json.loads()` for AI-generated JSON
+
+`json.loads()` is strict — it rejects any characters after the closing `}`, including trailing newlines, notes, or explanations that an LLM might append. This raises `Extra data: line N column 1`.
+
+Use `json.JSONDecoder().raw_decode(text)` instead. It parses the first complete JSON object and returns `(result, end_index)`, silently ignoring everything after the object closes. Also defensively skip any leading non-JSON text with `text[text.find("{"):]` before calling `raw_decode`.
+
+```python
+# Fragile — breaks on any trailing text
+result = json.loads(content)
+
+# Robust — ignores trailing text after the JSON object
+json_start = content.find("{")
+result, _ = json.JSONDecoder().raw_decode(content[json_start:])
+```
