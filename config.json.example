@@ -4,5 +4,14 @@
   },
   "openrouter": {
     "api_key": "YOUR_OPENROUTER_API_KEY_HERE"
+  },
+  "marketaux": {
+    "api_key": "YOUR_MARKETAUX_API_KEY_HERE"
+  },
+  "finnhub": {
+    "api_key": "YOUR_FINNHUB_API_KEY_HERE"
+  },
+  "adanos": {
+    "api_key": "YOUR_ADANOS_API_KEY_HERE"
   }
 }

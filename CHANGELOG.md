@@ -2,6 +2,51 @@
 
 ---
 
+## 2026-03-02 (session 7)
+
+### Change 1 — Volume alert: switched to yfinance 10-day average (`robo_monitor_multistock.py`)
+
+The volume alert baseline was previously self-computed from the bot's local 30-day JSON price history (7-day rolling average of completed trading days). This has been replaced with the native yfinance 10-day average daily volume (`averageDailyVolume10Day` / `averageVolume10days` from `.info`), which is more standard and eliminates dependency on locally accumulated history.
+
+- New method `MultiStockMonitor.get_avg_volume_10d(ticker)` calls `yf.Ticker(ticker).info`; falls back to the existing 7-day local calculation if yfinance returns `None`.
+- All pro-rata (intraday) adjustment logic is unchanged — it still scales the average by elapsed trading hours.
+- Volume alert description updated: "vs 7-day avg" → "vs 10-day avg" across the bot help text.
+- Alert type description in AI advisor prompts updated accordingly.
+
+### Change 2 — Volume alert: skip on weekends (`robo_monitor_multistock.py`)
+
+Previously, the volume comparison ran on weekends using the last trading day's stale full-day volume, producing false alerts. A new `is_market_weekend(ticker)` helper checks the current day-of-week in the stock's market timezone; if Saturday or Sunday, `vol_ratio` is set to `None` and the alert is skipped.
+
+- Applied before the grace period and pro-rata checks — weekend takes priority.
+- Public holidays are not handled (no external calendar library; weekends cover the main reported issue).
+
+### Change 3 — New news and sentiment APIs in AI Advisors (`ai_advisor.py`, `pre_ipo_advisor.py`, `telegram_bot_multistock.py`, `config.json.example`)
+
+Three new external APIs added to both `AIAdvisor` and `PreIpoAdvisor` (same additions, mirrored independently to keep `pre_ipo_advisor.py` self-contained):
+
+| API | Purpose | Key field |
+|-----|---------|-----------|
+| Marketaux (`api.marketaux.com`) | News articles (preferred over yfinance when key present) | `config.json → marketaux.api_key` |
+| Finnhub (`finnhub.io`) | Company news (supplemental) + fundamental metrics (P/E, EPS/revenue growth, margins, beta) | `config.json → finnhub.api_key` |
+| Adanos Finance (`api.adanos.org`) | Reddit, X/Twitter, Polymarket sentiment (buzz score, bullish/bearish %, trend); replaces public Reddit scrape when key present | `config.json → adanos.api_key` |
+
+All three keys are optional — each fails silently; the bot falls back to existing sources (yfinance news, public Reddit scrape) when keys are absent.
+
+**New methods added to both classes:**
+- `_get_marketaux_news(ticker)` → `list`
+- `_get_finnhub_news(ticker)` → `list`
+- `_get_finnhub_metrics(ticker)` → `dict`
+- `_get_adanos_sentiment(ticker)` → `dict` with `reddit`, `x`, `polymarket` sub-keys
+
+**Prompt changes:**
+- News section now prefers Marketaux with yfinance as fallback; Finnhub news shown as a separate supplemental block
+- Retail sentiment section: Adanos Reddit replaces public Reddit scrape; X/Twitter and Polymarket added as new sub-sections
+- New "FUNDAMENTAL METRICS (Finnhub)" section inserted before the monthly price summary
+
+**`telegram_bot_multistock.py`:** loads `marketaux_key`, `finnhub_key`, `adanos_key` from `config.json` and passes them to both advisors at startup.
+
+---
+
 ## 2026-02-25 (session 6 — hotfix)
 
 ### Hotfix — Raise `max_tokens` in IPO Listing Advisor (`pre_ipo_advisor.py`)

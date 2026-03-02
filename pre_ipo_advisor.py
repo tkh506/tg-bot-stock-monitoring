@@ -72,8 +72,123 @@ class PreIpoAdvisor:
     Supplemental: news, retail sentiment, macro.
     """
 
-    def __init__(self, api_key: str):
-        self.api_key = api_key
+    def __init__(self, api_key: str, marketaux_key: str = None,
+                 finnhub_key: str = None, adanos_key: str = None):
+        self.api_key       = api_key
+        self.marketaux_key = marketaux_key or None
+        self.finnhub_key   = finnhub_key   or None
+        self.adanos_key    = adanos_key    or None
+
+    # ── New data-enrichment API helpers ────────
+
+    def _get_marketaux_news(self, ticker: str) -> list:
+        """Fetch recent news articles from Marketaux (up to 10).
+        Returns [] if key absent or request fails."""
+        if not self.marketaux_key:
+            return []
+        try:
+            resp = requests.get(
+                "https://api.marketaux.com/v1/news/all",
+                params={"symbols": ticker, "api_token": self.marketaux_key,
+                        "limit": 10, "language": "en"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                print(f"[PreIpoAdvisor] Marketaux returned {resp.status_code} for {ticker}")
+                return []
+            return [
+                {
+                    "title":        a.get("title", ""),
+                    "source":       a.get("source", ""),
+                    "published_at": (a.get("published_at") or "")[:10],
+                    "description":  (a.get("description") or "")[:200],
+                }
+                for a in resp.json().get("data", []) if a.get("title")
+            ]
+        except Exception as e:
+            print(f"[PreIpoAdvisor] Marketaux fetch failed for {ticker}: {e}")
+            return []
+
+    def _get_finnhub_news(self, ticker: str) -> list:
+        """Fetch last 7 days of company news from Finnhub (up to 10 articles).
+        Returns [] if key absent or request fails."""
+        if not self.finnhub_key:
+            return []
+        try:
+            today    = datetime.utcnow()
+            from_dt  = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+            to_dt    = today.strftime("%Y-%m-%d")
+            resp = requests.get(
+                "https://finnhub.io/api/v1/company-news",
+                params={"symbol": ticker, "from": from_dt, "to": to_dt,
+                        "token": self.finnhub_key},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                print(f"[PreIpoAdvisor] Finnhub news returned {resp.status_code} for {ticker}")
+                return []
+            articles = resp.json() or []
+            return [
+                {
+                    "headline": a.get("headline", ""),
+                    "source":   a.get("source", ""),
+                    "date":     (datetime.utcfromtimestamp(a["datetime"]).strftime("%Y-%m-%d")
+                                 if a.get("datetime") else ""),
+                    "summary":  (a.get("summary") or "")[:200],
+                }
+                for a in articles[:10] if a.get("headline")
+            ]
+        except Exception as e:
+            print(f"[PreIpoAdvisor] Finnhub news fetch failed for {ticker}: {e}")
+            return []
+
+    def _get_finnhub_metrics(self, ticker: str) -> dict:
+        """Fetch key financial metrics from Finnhub.
+        Returns {} if key absent or request fails."""
+        if not self.finnhub_key:
+            return {}
+        try:
+            resp = requests.get(
+                "https://finnhub.io/api/v1/stock/metric",
+                params={"symbol": ticker, "metric": "all", "token": self.finnhub_key},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                print(f"[PreIpoAdvisor] Finnhub metrics returned {resp.status_code} for {ticker}")
+                return {}
+            m = resp.json().get("metric", {})
+            keys = ["52WeekHigh", "52WeekLow", "peNormalizedAnnual", "epsGrowth3Y",
+                    "revenueGrowth3Y", "currentRatioAnnual", "netMarginAnnual", "beta"]
+            return {k: m[k] for k in keys if m.get(k) is not None}
+        except Exception as e:
+            print(f"[PreIpoAdvisor] Finnhub metrics fetch failed for {ticker}: {e}")
+            return {}
+
+    def _get_adanos_sentiment(self, ticker: str) -> dict:
+        """Fetch Reddit / X / Polymarket sentiment from Adanos API.
+        Returns {"reddit": {...}, "x": {...}, "polymarket": {...}} or {} if key absent.
+        When available, Adanos Reddit replaces the public .json Reddit scrape."""
+        if not self.adanos_key:
+            return {}
+        headers = {"X-API-Key": self.adanos_key}
+        platforms = {
+            "reddit":     f"https://api.adanos.org/reddit/stocks/v1/stock/{ticker}",
+            "x":          f"https://api.adanos.org/x/stocks/v1/stock/{ticker}",
+            "polymarket": f"https://api.adanos.org/polymarket/stocks/v1/stock/{ticker}",
+        }
+        result = {}
+        for key, url in platforms.items():
+            try:
+                resp = requests.get(url, headers=headers, params={"days": 7}, timeout=10)
+                if resp.status_code == 200:
+                    result[key] = resp.json()
+                elif resp.status_code == 404:
+                    result[key] = {"found": False}
+                else:
+                    print(f"[PreIpoAdvisor] Adanos {key} returned {resp.status_code} for {ticker}")
+            except Exception as e:
+                print(f"[PreIpoAdvisor] Adanos {key} failed for {ticker}: {e}")
+        return result
 
     # ── Sentiment helpers (identical to AIAdvisor; prefix changed for log clarity) ──
 
@@ -504,12 +619,24 @@ class PreIpoAdvisor:
         except Exception as e:
             print(f"[PreIpoAdvisor] Stock info fetch failed for {ticker}: {e}")
 
-        # ── Retail sentiment ──
+        # ── Retail sentiment (StockTwits, Google Trends, Adanos / Reddit fallback) ──
         company_name = stock_info.get("longName", "")
         print(f"[PreIpoAdvisor] Fetching retail sentiment for {ticker}...")
         stocktwits_data = self._get_stocktwits_sentiment(ticker)
         google_trends   = self._get_google_trends(ticker, company_name)
-        reddit_data     = self._get_reddit_sentiment(ticker)
+
+        # Adanos provides richer Reddit + X + Polymarket data when key is available.
+        # Fall back to the public Reddit .json scrape when Adanos key is absent.
+        adanos_data = self._get_adanos_sentiment(ticker)
+        reddit_data = (adanos_data.get("reddit", {})
+                       if adanos_data else self._get_reddit_sentiment(ticker))
+
+        # ── New enrichment APIs ──
+        print(f"[PreIpoAdvisor] Fetching Marketaux news for {ticker}...")
+        marketaux_news  = self._get_marketaux_news(ticker)
+        print(f"[PreIpoAdvisor] Fetching Finnhub data for {ticker}...")
+        finnhub_news    = self._get_finnhub_news(ticker)
+        finnhub_metrics = self._get_finnhub_metrics(ticker)
 
         return {
             "ticker":               ticker,
@@ -543,7 +670,11 @@ class PreIpoAdvisor:
             "stock_info":           stock_info,
             "stocktwits":           stocktwits_data,
             "google_trends":        google_trends,
+            "adanos":               adanos_data,
             "reddit":               reddit_data,
+            "marketaux_news":       marketaux_news,
+            "finnhub_news":         finnhub_news,
+            "finnhub_metrics":      finnhub_metrics,
             "analysis_time":        datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
         }
 
@@ -607,11 +738,33 @@ class PreIpoAdvisor:
             f"{_fmt_pct(target_ctx['benchmark_1y_pct'])}"
         )
 
-        # ── News ──
-        news_block = (
-            "\n".join(f"  - {h}" for h in target_ctx["news_headlines"])
-            if target_ctx["news_headlines"] else "  (No recent news available)"
-        )
+        # ── News — prefer Marketaux; fall back to yfinance headlines ──
+        mx_news = target_ctx.get("marketaux_news", [])
+        if mx_news:
+            news_lines = "\n".join(
+                f"  [{a['published_at']}] {a['title']}  ({a['source']})"
+                + (f"\n    {a['description']}" if a.get("description") else "")
+                for a in mx_news
+            )
+            news_block = f"(Marketaux — {len(mx_news)} articles)\n{news_lines}"
+        else:
+            news_block = (
+                "(yfinance headlines)\n"
+                + ("\n".join(f"  - {h}" for h in target_ctx["news_headlines"])
+                   if target_ctx["news_headlines"] else "  (No recent news available)")
+            )
+
+        # ── Finnhub news (supplemental) ──
+        fh_news = target_ctx.get("finnhub_news", [])
+        if fh_news:
+            fh_news_lines = "\n".join(
+                f"  [{a['date']}] {a['headline']}  ({a['source']})"
+                + (f"\n    {a['summary']}" if a.get("summary") else "")
+                for a in fh_news
+            )
+            finnhub_news_block = f"(Finnhub — {len(fh_news)} articles)\n{fh_news_lines}"
+        else:
+            finnhub_news_block = ""
 
         # ── Stock info ──
         info_lines = "\n".join(f"  {k}: {v}"
@@ -638,22 +791,77 @@ class PreIpoAdvisor:
             f"3-month peak: {gt['peak_3m']}/100"
         ) if gt else "Google Trends: no data (pytrends unavailable or blocked)"
 
-        rd = target_ctx.get("reddit", {})
-        if rd.get("skipped"):
-            reddit_block = f"Reddit: skipped ({rd.get('reason', 'HK ticker')})"
-        elif not rd or rd.get("total_posts", 0) == 0:
+        # Reddit — Adanos (quantitative) or public .json scrape (qualitative)
+        adanos = target_ctx.get("adanos", {})
+        rd_raw = target_ctx.get("reddit", {})
+        if adanos and adanos.get("reddit"):
+            rd_a = adanos["reddit"]
+            if rd_a.get("found") is False:
+                reddit_block = "Reddit (Adanos): no data found for this ticker"
+            else:
+                reddit_block = (
+                    f"Reddit (Adanos — 7d): buzz={rd_a.get('buzz_score','N/A')}  |  "
+                    f"trend={rd_a.get('trend','N/A')}  |  "
+                    f"bullish={rd_a.get('bullish_pct','N/A')}%  |  "
+                    f"bearish={rd_a.get('bearish_pct','N/A')}%  |  "
+                    f"mentions={rd_a.get('total_mentions','N/A')}"
+                )
+        elif rd_raw.get("skipped"):
+            reddit_block = f"Reddit: skipped ({rd_raw.get('reason', 'HK ticker')})"
+        elif not rd_raw or rd_raw.get("total_posts", 0) == 0:
             reddit_block = "Reddit: no ticker-specific posts found (or fetch blocked)"
         else:
             post_lines = "\n".join(
                 f"  [{p['subreddit']}] {p['title']}  "
                 f"(score: {p['score']}, upvotes: {int(p['upvote_ratio']*100)}%, "
                 f"comments: {p['num_comments']})"
-                for p in rd["posts"]
+                for p in rd_raw["posts"]
             )
             reddit_block = (
-                f"Reddit — {rd['total_posts']} recent posts found, "
-                f"top {len(rd['posts'])} shown:\n" + post_lines
+                f"Reddit (public) — {rd_raw['total_posts']} recent posts found, "
+                f"top {len(rd_raw['posts'])} shown:\n" + post_lines
             )
+
+        # X/Twitter (Adanos) — only shown when key available
+        x_block = ""
+        if adanos and adanos.get("x"):
+            x_a = adanos["x"]
+            if x_a.get("found") is not False:
+                x_block = (
+                    f"\nX/Twitter (Adanos — 7d): buzz={x_a.get('buzz_score','N/A')}  |  "
+                    f"trend={x_a.get('trend','N/A')}  |  "
+                    f"bullish={x_a.get('bullish_pct','N/A')}%  |  "
+                    f"bearish={x_a.get('bearish_pct','N/A')}%  |  "
+                    f"mentions={x_a.get('total_mentions','N/A')}"
+                )
+
+        # Polymarket (Adanos) — only shown when key available
+        poly_block = ""
+        if adanos and adanos.get("polymarket"):
+            pm_a = adanos["polymarket"]
+            if pm_a.get("found") is not False:
+                poly_block = (
+                    f"\nPolymarket (Adanos — 7d): buzz={pm_a.get('buzz_score','N/A')}  |  "
+                    f"bullish={pm_a.get('bullish_pct','N/A')}%  |  "
+                    f"bearish={pm_a.get('bearish_pct','N/A')}%  |  "
+                    f"trades={pm_a.get('trade_count','N/A')}  |  "
+                    f"markets={pm_a.get('market_count','N/A')}  |  "
+                    f"liquidity=${pm_a.get('total_liquidity','N/A')}"
+                )
+
+        # Finnhub fundamental metrics
+        fh_m = target_ctx.get("finnhub_metrics", {})
+        if fh_m:
+            def _fmtm(v):
+                return f"{v:.2f}" if isinstance(v, float) else str(v)
+            finnhub_metrics_block = (
+                "════════════════════════════════\n"
+                "FUNDAMENTAL METRICS (Finnhub)\n"
+                "════════════════════════════════\n"
+                + "\n".join(f"  {k}: {_fmtm(v)}" for k, v in fh_m.items())
+            )
+        else:
+            finnhub_metrics_block = ""
 
         # ── Premium history ──
         premium_section = ""
@@ -812,16 +1020,17 @@ SECTION 3 — SUPPLEMENTAL DATA (supporting context only)
 MARKET BENCHMARK
 {bm_block}
 
-RECENT NEWS (up to 15 headlines)
+NEWS (primary source):
 {news_block}
-
+{"" if not finnhub_news_block else chr(10) + "NEWS (Finnhub — supplemental):" + chr(10) + finnhub_news_block}
 RETAIL SENTIMENT
 {stocktwits_block}
 
 {gt_block}
 
-{reddit_block}
+{reddit_block}{x_block}{poly_block}
 
+{finnhub_metrics_block}
 ════════════════════════════════
 SECTION 4 — BOT ALERT TYPES AVAILABLE
 ════════════════════════════════
@@ -832,7 +1041,7 @@ SECTION 4 — BOT ALERT TYPES AVAILABLE
 
 3. "price_7d" — 7-day price change %  {{operator}}  {{threshold}}%
 
-4. "volume"   — today's volume / 7-day average volume  {{operator}}  {{threshold}}
+4. "volume"   — today's volume / 10-day average volume  {{operator}}  {{threshold}}
    • Threshold is a multiplier (e.g. 2.5 = 2.5× average daily volume)
 
 ════════════════════════════════

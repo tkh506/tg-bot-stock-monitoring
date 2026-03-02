@@ -1964,7 +1964,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Premium: Price vs NAV\n"
         "• 1-Day: Daily change\n"
         "• 7-Day: Weekly change\n"
-        "• Volume: vs 7-day avg"
+        "• Volume: vs 10-day avg"
     )
 
     if update.callback_query:
@@ -2029,10 +2029,28 @@ def main():
     openrouter_key = (
         main_config.get('openrouter', {}).get('api_key', '') or ''
     ).strip()
+
+    # Optional data-enrichment API keys (all fail silently if absent)
+    marketaux_key = (main_config.get('marketaux', {}).get('api_key', '') or '').strip() or None
+    finnhub_key   = (main_config.get('finnhub',   {}).get('api_key', '') or '').strip() or None
+    adanos_key    = (main_config.get('adanos',    {}).get('api_key', '') or '').strip() or None
+    if marketaux_key and marketaux_key == "YOUR_MARKETAUX_API_KEY_HERE":
+        marketaux_key = None
+    if finnhub_key and finnhub_key == "YOUR_FINNHUB_API_KEY_HERE":
+        finnhub_key = None
+    if adanos_key and adanos_key == "YOUR_ADANOS_API_KEY_HERE":
+        adanos_key = None
+
     if openrouter_key and openrouter_key != "YOUR_OPENROUTER_API_KEY_HERE":
-        ai_advisor = AIAdvisor(openrouter_key)
+        ai_advisor = AIAdvisor(openrouter_key,
+                               marketaux_key=marketaux_key,
+                               finnhub_key=finnhub_key,
+                               adanos_key=adanos_key)
         print("🤖 AI Advisor: enabled (Openrouter key loaded)")
-        pre_ipo_advisor = PreIpoAdvisor(openrouter_key)
+        pre_ipo_advisor = PreIpoAdvisor(openrouter_key,
+                                        marketaux_key=marketaux_key,
+                                        finnhub_key=finnhub_key,
+                                        adanos_key=adanos_key)
         print("🚀 IPO Listing Advisor: enabled (DXYZ lifecycle analysis)")
     else:
         ai_advisor = None

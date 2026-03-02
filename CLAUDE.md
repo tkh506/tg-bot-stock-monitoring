@@ -35,12 +35,12 @@ price_history/history_{ticker}.json  # 30-day price history per ticker
 | `premium` | (Price - NAV) / NAV × 100, compared with `>` or `<` operator |
 | `price_1d` | 1-day price change %, compared with `>` or `<` |
 | `price_7d` | 7-day price change %, compared with `>` or `<` |
-| `volume` | Current volume vs 7-day avg (ratio), compared with `>` or `<` |
+| `volume` | Current volume vs 10-day avg (from yfinance `.info`), compared with `>` or `<` |
 
 ### Alert Logic
 - **State-based**: notifications fire only on state *change* (triggered → cleared, or cleared → triggered)
 - Alert state persisted in `alert_states/` so restarts don't re-fire old alerts
-- Volume alerts are skipped during a 2-hour grace period after market open (avoids false low-volume alerts)
+- Volume alerts are skipped on weekends (no trading) and during a 2-hour grace period after market open (avoids false low-volume alerts)
 
 ### Volume: Pro-Rata Aware
 - During market hours, the 7-day average is scaled by `elapsed_trading_hours / total_trading_hours`
@@ -67,10 +67,16 @@ price_history/history_{ticker}.json  # 30-day price history per ticker
 - Model configured via `AI_MODEL` constant in `ai_advisor.py` (currently `deepseek/deepseek-v3.2`; swap freely)
 - `max_tokens = 4000` — needed for verbose models (GPT-5 mini, DeepSeek); lower models may truncate at 1500
 - AI analyses: **1-year daily OHLCV from yfinance** (52w range, 20/50/200-day SMA, price changes 1d–1y, volume stats, annualised volatility, monthly summary, recent 60-day OHLCV) + yfinance news (up to 15 headlines) + benchmark return (SPY/^HSI) + stock info + local premium history (if NAV applicable) + retail sentiment (StockTwits, Google Trends, Reddit)
-- **Retail sentiment sources** (all no-auth, fail silently):
+- **News sources** (fail silently; Marketaux preferred over yfinance when key present):
+  - Marketaux: up to 10 news articles with source + description; configured via `config.json` → `marketaux.api_key`
+  - Finnhub news: last 7 days of company news; configured via `config.json` → `finnhub.api_key`
+  - yfinance `.news`: fallback if Marketaux key absent
+- **Fundamental metrics**: Finnhub `/stock/metric` — P/E, EPS growth, revenue growth, net margin, current ratio, beta; shown as a new prompt section
+- **Retail sentiment sources** (all fail silently):
   - StockTwits: `api.stocktwits.com` — bullish/bearish counts + sample messages
   - Google Trends: via `pytrends` — search interest level + 4-week trend
-  - Reddit: public `.json` endpoint — ticker search across r/investing, r/stocks, r/wallstreetbets; skipped for HK tickers
+  - Adanos Finance (`api.adanos.org`): Reddit, X/Twitter, Polymarket sentiment (buzz score, bullish/bearish %, trend); configured via `config.json` → `adanos.api_key`; replaces public Reddit scrape when key present
+  - Reddit: public `.json` endpoint — fallback when Adanos key absent; skipped for HK tickers
 - AI returns either:
   - `immediate` → display recommendation message, no alert changes
   - `alerts` → display two-tier (watch/action) alert proposals (2–6 alerts), ask for confirmation
@@ -124,10 +130,19 @@ requests              # Direct Telegram API calls (robo_monitor_multistock.py) +
   },
   "openrouter": {
     "api_key": "YOUR_OPENROUTER_API_KEY"
+  },
+  "marketaux": {
+    "api_key": "YOUR_MARKETAUX_API_KEY"
+  },
+  "finnhub": {
+    "api_key": "YOUR_FINNHUB_API_KEY"
+  },
+  "adanos": {
+    "api_key": "YOUR_ADANOS_API_KEY"
   }
 }
 ```
-The `openrouter` block is optional — if absent or placeholder, the bot starts normally but the "Ask AI Advice" button shows a "not configured" message.
+The `openrouter` block is optional — if absent or placeholder, the bot starts normally but the "Ask AI Advice" button shows a "not configured" message. The `marketaux`, `finnhub`, and `adanos` blocks are also optional — each fails silently if absent; existing sources (yfinance news, Reddit scrape) are used as fallback.
 
 ## User Config Format (`user_configs/config_user_{id}.json`)
 ```json

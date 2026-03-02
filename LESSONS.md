@@ -282,6 +282,51 @@ Diagnosis signal: `finish_reason == "length"` fires consistently regardless of w
 
 ---
 
+### 24. Prefer yfinance `.info` volume fields over self-computed rolling averages
+
+yfinance provides a pre-computed 10-day average daily volume field directly in `Ticker.info`:
+- `averageDailyVolume10Day` (newer yfinance)
+- `averageVolume10days` (some older versions)
+
+Using these directly is simpler and more reliable than maintaining a local rolling average from price history JSON. Implement a fallback:
+
+```python
+info = yf.Ticker(ticker).info
+avg = info.get('averageDailyVolume10Day') or info.get('averageVolume10days')
+if not avg:
+    avg = self_computed_7d_fallback()
+```
+
+---
+
+### 25. Volume alerts must check for weekends in the market's own timezone
+
+The 15-min monitor runs 24/7 but markets are closed on weekends. When the market is closed, yfinance still returns Friday's last trading day data. Without a weekend check, the monitor will compare that stale volume against the average every 15 minutes all weekend, triggering repeated spurious alerts.
+
+Fix: add a weekend guard before the pro-rata/grace-period logic using `datetime.now(market_tz).weekday() >= 5`. This is market-timezone-aware (important for HK vs US). Public holidays are harder to handle without a calendar library and can be deferred.
+
+```python
+def is_market_weekend(ticker: str) -> bool:
+    tz = pytz.timezone(MARKET_INFO[get_market_key(ticker)]['timezone'])
+    return datetime.now(tz).weekday() >= 5  # 5=Sat, 6=Sun
+```
+
+---
+
+### 26. Adanos Finance API: authentication via `X-API-Key` header (not Bearer)
+
+Adanos Finance (`api.adanos.org`) uses `X-API-Key: sk_live_...` as the auth header — not `Authorization: Bearer`. The three stock sentiment endpoints (Reddit, X, Polymarket) share the same key and the same response schema:
+
+- `GET /reddit/stocks/v1/stock/{ticker}?days=7`
+- `GET /x/stocks/v1/stock/{ticker}?days=7`
+- `GET /polymarket/stocks/v1/stock/{ticker}?days=7`
+
+Key response fields (all three platforms): `found`, `buzz_score`, `trend`, `bullish_pct`, `bearish_pct`, `total_mentions` (Reddit/X) or `trade_count`/`market_count`/`total_liquidity` (Polymarket).
+
+A 404 response means the ticker was not found on that platform — treat as `{"found": False}` and display gracefully. The free tier has only 250 requests/month, so fail silently rather than retrying.
+
+---
+
 ### 16. Use `raw_decode()` instead of `json.loads()` for AI-generated JSON
 
 `json.loads()` is strict — it rejects any characters after the closing `}`, including trailing newlines, notes, or explanations that an LLM might append. This raises `Extra data: line N column 1`.

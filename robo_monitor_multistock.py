@@ -48,6 +48,13 @@ def get_market_key(ticker):
     return 'US'  # Default: assume US market
 
 
+def is_market_weekend(ticker: str) -> bool:
+    """Return True if today is Saturday or Sunday in the stock's market timezone.
+    Used to suppress volume alerts on weekends when no trading occurs."""
+    tz = pytz.timezone(MARKET_INFO[get_market_key(ticker)]['timezone'])
+    return datetime.now(tz).weekday() >= 5  # 5=Saturday, 6=Sunday
+
+
 def get_market_elapsed_info(ticker):
     """
     Work out how far into the current trading session we are.
@@ -436,6 +443,18 @@ class MultiStockMonitor:
         except Exception as e:
             print(f"      Could not seed history for {ticker}: {e}")
 
+    def get_avg_volume_10d(self, ticker: str):
+        """Fetch yfinance's native 10-day average daily volume from .info.
+        Field name varies slightly across yfinance versions — tries both.
+        Returns an int or None on failure (caller should fall back to local 7-day avg)."""
+        try:
+            info = yf.Ticker(ticker).info
+            avg = info.get('averageDailyVolume10Day') or info.get('averageVolume10days')
+            return int(avg) if avg and avg > 0 else None
+        except Exception as e:
+            print(f"      Could not fetch 10d avg volume for {ticker}: {e}")
+            return None
+
     def process_stock(self, user_id, stock):
         """Process one stock for one user"""
         ticker = stock['ticker']
@@ -466,25 +485,35 @@ class MultiStockMonitor:
         # Get changes
         change_1d = self.history.get_price_change_1d(ticker)
         change_7d = self.history.get_price_change_7d(ticker)
-        vol_avg = self.history.get_volume_average_7d(ticker)
+
+        # Use yfinance 10-day average volume directly; fall back to self-computed 7-day
+        vol_avg = self.get_avg_volume_10d(ticker)
+        if vol_avg is None:
+            vol_avg = self.history.get_volume_average_7d(ticker)
+            if vol_avg:
+                print(f"      10d avg unavailable — using local 7d avg: {vol_avg:,}")
 
         # --- Smart volume ratio (pro-rata aware) ---
         is_market_open, elapsed_hours, total_hours, prorata_factor = \
             get_market_elapsed_info(ticker)
 
-        if is_market_open and elapsed_hours < VOLUME_GRACE_PERIOD_HOURS:
+        if is_market_weekend(ticker):
+            # No trading on weekends — skip volume check to avoid spurious alerts
+            vol_ratio = None
+            print(f"      Volume check skipped: weekend in {get_market_key(ticker)} timezone")
+        elif is_market_open and elapsed_hours < VOLUME_GRACE_PERIOD_HOURS:
             # Too early in the session – don't compare yet; avoid false low-volume alerts
             vol_ratio = None
             print(f"      Volume check skipped: market open {elapsed_hours:.1f}h "
                   f"(grace period = {VOLUME_GRACE_PERIOD_HOURS}h)")
         elif is_market_open and vol_avg and vol_avg > 0 and prorata_factor > 0:
-            # Scale the 7-day average to how much of the day has elapsed
+            # Scale the 10-day average to how much of the day has elapsed
             prorata_avg = vol_avg * prorata_factor
             vol_ratio = (volume / prorata_avg) if volume else None
-            print(f"      Volume: {volume:,} vs pro-rata avg {prorata_avg:,.0f} "
+            print(f"      Volume: {volume:,} vs pro-rata 10d avg {prorata_avg:,.0f} "
                   f"({elapsed_hours:.1f}h / {total_hours}h = {prorata_factor:.2f}x)")
         else:
-            # Market closed – yfinance already has the full-day volume; compare normally
+            # Market closed on a weekday – yfinance has the full-day volume; compare normally
             vol_ratio = (volume / vol_avg) if (volume and vol_avg and vol_avg > 0) else None
 
         premium_str = f"{premium:.1f}%" if premium is not None else "N/A"
