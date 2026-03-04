@@ -29,6 +29,100 @@ CONFIG_DIR = "user_configs"
 ALERT_STATE_DIR = "alert_states"
 PRICE_HISTORY_DIR = "price_history"
 
+# Market session info (mirrors robo_monitor_multistock.py for extended hours support)
+MARKET_INFO = {
+    'US': {
+        'timezone': 'America/New_York',
+        'open_hour': 9,  'open_min': 30,
+        'close_hour': 16, 'close_min': 0,
+        'pre_market_start': (4, 0),    # 4:00 AM ET
+        'after_hours_end':  (20, 0),   # 8:00 PM ET
+    },
+    'HK': {
+        'timezone': 'Asia/Hong_Kong',
+        'open_hour': 9,  'open_min': 30,
+        'close_hour': 16, 'close_min': 0,
+        'pre_market_start': None,      # HKEX has no extended hours
+        'after_hours_end':  None,
+    },
+}
+
+
+def get_market_key(ticker: str) -> str:
+    if ticker.upper().endswith('.HK'):
+        return 'HK'
+    return 'US'
+
+
+def get_market_session(ticker: str) -> str:
+    """Return 'pre_market', 'regular', 'after_hours', or 'closed'."""
+    info = MARKET_INFO[get_market_key(ticker)]
+    tz = pytz.timezone(info['timezone'])
+    now = datetime.now(tz)
+
+    if now.weekday() >= 5:
+        return 'closed'
+
+    market_open  = now.replace(hour=info['open_hour'],  minute=info['open_min'],  second=0, microsecond=0)
+    market_close = now.replace(hour=info['close_hour'], minute=info['close_min'], second=0, microsecond=0)
+
+    if market_open <= now < market_close:
+        return 'regular'
+
+    if info.get('pre_market_start'):
+        pre_h, pre_m = info['pre_market_start']
+        pre_start = now.replace(hour=pre_h, minute=pre_m, second=0, microsecond=0)
+        if pre_start <= now < market_open:
+            return 'pre_market'
+
+    if info.get('after_hours_end'):
+        ah_h, ah_m = info['after_hours_end']
+        after_end = now.replace(hour=ah_h, minute=ah_m, second=0, microsecond=0)
+        if market_close <= now < after_end:
+            return 'after_hours'
+
+    return 'closed'
+
+
+def is_market_weekend(ticker: str) -> bool:
+    """Return True if the relevant exchange is currently on a weekend."""
+    tz = pytz.timezone(MARKET_INFO[get_market_key(ticker)]['timezone'])
+    return datetime.now(tz).weekday() >= 5
+
+
+def get_extended_hours_price(ticker: str, session: str):
+    """Fetch the most recent extended-hours price via intraday history (prepost=True).
+    Covers standard pre-market (4–9:30 AM ET) and after-hours (4–8 PM ET).
+    Note: overnight trading (8 PM–4 AM ET, Blue Ocean ATS) is not available via
+    Yahoo Finance's public data feed; the last after-hours close is shown instead.
+    Label is 'pre-market' for pre_market session, 'after-hours' for everything else.
+    Returns (price: float, label: str) or (None, None) if unavailable."""
+    try:
+        mkt = MARKET_INFO[get_market_key(ticker)]
+        # Market has no extended hours (e.g. HKEX)
+        if not mkt.get('pre_market_start') and not mkt.get('after_hours_end'):
+            return None, None
+
+        label = 'pre-market' if session == 'pre_market' else 'after-hours'
+
+        hist = yf.Ticker(ticker).history(period='5d', interval='1m', prepost=True)
+        if not hist.empty:
+            last_price = float(hist['Close'].iloc[-1])
+            if last_price > 0:
+                tz = pytz.timezone(mkt['timezone'])
+                last_ts = hist.index[-1]
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.tz_localize('UTC')
+                last_local = last_ts.astimezone(tz)
+                market_open  = last_local.replace(hour=mkt['open_hour'],  minute=mkt['open_min'],  second=0, microsecond=0)
+                market_close = last_local.replace(hour=mkt['close_hour'], minute=mkt['close_min'], second=0, microsecond=0)
+                if last_local >= market_close or last_local < market_open:
+                    return last_price, label
+
+        return None, None
+    except Exception:
+        return None, None
+
 # Conversation states
 ADD_STOCK_TICKER, ADD_STOCK_NAV = range(2)
 ALERT_TYPE, ALERT_OPERATOR, ALERT_THRESHOLD, ALERT_CONFIRM = range(10, 14)
@@ -267,13 +361,29 @@ class PriceHistory:
         except FileNotFoundError:
             return {"ticker": ticker, "daily_prices": [], "last_update": None}
 
-    def get_price_change_1d(self, ticker):
+    def get_price_change_1d(self, ticker, current_price=None, session=None):
+        """Compute 1D % change.
+        If current_price is provided (extended hours), compare against the appropriate
+        last regular close: [-2] for after_hours (today's close already stored),
+        [-1] for pre_market (today hasn't started)."""
         data = self.load(ticker)
-        if len(data['daily_prices']) < 2:
-            return None
-        today = data['daily_prices'][-1]['price']
-        yesterday = data['daily_prices'][-2]['price']
-        return ((today - yesterday) / yesterday) * 100
+        prices = data['daily_prices']
+        if current_price is not None:
+            if session == 'after_hours':
+                if len(prices) < 2:
+                    return None
+                ref = prices[-2]['price']
+            else:  # pre_market
+                if len(prices) < 1:
+                    return None
+                ref = prices[-1]['price']
+            return ((current_price - ref) / ref) * 100
+        else:
+            if len(prices) < 2:
+                return None
+            today = prices[-1]['price']
+            yesterday = prices[-2]['price']
+            return ((today - yesterday) / yesterday) * 100
 
 
 config_manager = UserConfigManager(CONFIG_DIR)
@@ -417,20 +527,33 @@ async def check_status_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stock_id = stock['id']
         alerts = stock.get('alerts', [])
 
-        # Fetch live price
+        # Fetch live price (regular session close)
         price, volume = get_stock_data(ticker)
+
+        # Check for extended hours price if outside regular trading hours
+        session = get_market_session(ticker)
+        display_price = price
+        price_label = None
+        if price and (session in ('pre_market', 'after_hours') or (session == 'closed' and not is_market_weekend(ticker))):
+            ext_price, price_label = get_extended_hours_price(ticker, session)
+            if ext_price:
+                display_price = ext_price
 
         message += f"*{ticker}*\n"
 
-        if price:
-            premium = ((price - nav) / nav) * 100 if nav else 0
-            message += f"• Price: ${price:.2f} | NAV: ${nav:.2f}\n"
+        if display_price:
+            nav_f = float(nav) if nav else 0
+            premium = ((display_price - nav_f) / nav_f) * 100 if nav_f else 0
+            label_str = f" _({price_label})_" if price_label else ""
+            message += f"• Price: ${display_price:.2f}{label_str} | NAV: ${nav:.2f}\n"
 
-            if nav > 0:
+            if nav_f > 0:
                 message += f"• Premium: {premium:.1f}%\n"
 
-            # Get 1-day change
-            change_1d = price_history.get_price_change_1d(ticker)
+            # Get 1-day change (uses extended hours price when applicable)
+            ext_arg = display_price if price_label else None
+            eff_session = 'after_hours' if price_label == 'after-hours' else ('pre_market' if price_label == 'pre-market' else session)
+            change_1d = price_history.get_price_change_1d(ticker, current_price=ext_arg, session=eff_session)
             if change_1d:
                 sign = '+' if change_1d > 0 else ''
                 message += f"• 1D: {sign}{change_1d:.1f}%\n"
