@@ -1,6 +1,12 @@
 # Secrets — never commit
 config.json
 
+# Local-only documentation (not for repo)
+CLAUDE.md
+CHANGELOG.md
+LESSONS.md
+MULTISTOCK_DEPLOY_GUIDE.md
+
 # Runtime-generated data directories
 user_configs/
 alert_states/
