@@ -15,7 +15,7 @@ from datetime import datetime
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-AI_MODEL       = "openai/gpt-5-mini"          # Openrouter model ID for DeepSeek V3.2
+AI_MODEL       = "google/gemini-3.1-pro-preview"
 AI_TIMEOUT     = 90  # seconds — generous timeout; analysis can take 20–40 s
 
 # Alert types the bot supports
@@ -942,7 +942,7 @@ Return ONLY valid JSON — no markdown fences, no comments, no text outside the 
             "model": AI_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
-            "max_tokens": 4000,
+            "max_tokens": 12000,
         }
         response = requests.post(OPENROUTER_URL, headers=headers,
                                  json=payload, timeout=AI_TIMEOUT)

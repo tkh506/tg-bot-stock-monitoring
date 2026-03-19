@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 DXYZ_TICKER        = "DXYZ"
-PRE_IPO_AI_MODEL   = "openai/gpt-5-mini"
+PRE_IPO_AI_MODEL   = "google/gemini-3.1-pro-preview"
 PRE_IPO_AI_TIMEOUT = 120   # seconds — generous; DXYZ dataset is larger than a single stock
 
 # Alert types the bot supports (must stay in sync with the main bot)
@@ -1136,7 +1136,7 @@ Return ONLY valid JSON — no markdown fences, no comments, no text outside the 
             "model":       PRE_IPO_AI_MODEL,
             "messages":    [{"role": "user", "content": prompt}],
             "temperature": 0.3,
-            "max_tokens":  8000,
+            "max_tokens":  16000,
         }
         response = requests.post(OPENROUTER_URL, headers=headers,
                                  json=payload, timeout=PRE_IPO_AI_TIMEOUT)
