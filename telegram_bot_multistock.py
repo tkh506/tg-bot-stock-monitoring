@@ -1967,29 +1967,49 @@ async def ipo_ai_signal_selected(update: Update, context: ContextTypes.DEFAULT_T
                 parse_mode='Markdown'
             )
         else:
-            # Too long — split into two messages:
-            # Part 1: header + analysis (no buttons, user can scroll and read)
-            # Part 2: alerts section with Yes/No buttons
+            # Too long — split into 2 or 3 messages.
+            # alerts_section (with Yes/No buttons) is ALWAYS the last message so
+            # it is never truncated away.
             msg1 = header + analysis_block
-            msg2 = alerts_section
 
-            # If even part 1 alone is too long, push supplemental into part 2
-            if len(msg1) > 4096:
+            if len(msg1) <= 4096:
+                # Primary + supplemental fits in msg1; alerts_section goes alone in msg2.
+                supp = supplemental_block.lstrip('\n')
+                msg2 = supp + "\n\n" + alerts_section
+                if len(msg2) <= 4096:
+                    # Supplemental + alerts fits together — 2 messages total.
+                    await query.edit_message_text(msg1, parse_mode='Markdown')
+                    await query.message.reply_text(
+                        msg2,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode='Markdown'
+                    )
+                else:
+                    # Supplemental + alerts doesn't fit — 3 messages total.
+                    if len(supp) > 4096:
+                        supp = supp[:4080] + "\n_(truncated)_"
+                    await query.edit_message_text(msg1, parse_mode='Markdown')
+                    await query.message.reply_text(supp, parse_mode='Markdown')
+                    await query.message.reply_text(
+                        alerts_section,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode='Markdown'
+                    )
+            else:
+                # Even primary alone is too long — 3 messages: primary | supplemental | alerts.
                 msg1 = header + primary_block
-                msg2 = supplemental_block.lstrip('\n') + "\n\n" + alerts_section
-
-            # Final safety truncation (should rarely trigger)
-            if len(msg1) > 4096:
-                msg1 = msg1[:4080] + "\n_(truncated)_"
-            if len(msg2) > 4096:
-                msg2 = msg2[:4080] + "\n_(truncated)_"
-
-            await query.edit_message_text(msg1, parse_mode='Markdown')
-            await query.message.reply_text(
-                msg2,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
+                supp = supplemental_block.lstrip('\n')
+                if len(msg1) > 4096:
+                    msg1 = msg1[:4080] + "\n_(truncated)_"
+                if len(supp) > 4096:
+                    supp = supp[:4080] + "\n_(truncated)_"
+                await query.edit_message_text(msg1, parse_mode='Markdown')
+                await query.message.reply_text(supp, parse_mode='Markdown')
+                await query.message.reply_text(
+                    alerts_section,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
 
         return PRE_IPO_CONFIRM_ALERTS
 
