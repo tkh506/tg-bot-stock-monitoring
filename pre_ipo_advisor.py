@@ -21,8 +21,9 @@ from datetime import datetime, timedelta
 
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 DXYZ_TICKER        = "DXYZ"
+VCX_TICKER         = "VCX"
 PRE_IPO_AI_MODEL   = "google/gemini-3.1-pro-preview"
-PRE_IPO_AI_TIMEOUT = 120   # seconds — generous; DXYZ dataset is larger than a single stock
+PRE_IPO_AI_TIMEOUT = 120   # seconds — generous; DXYZ+VCX dataset is larger than a single stock
 
 # Alert types the bot supports (must stay in sync with the main bot)
 VALID_ALERT_TYPES     = {"premium", "price_1d", "price_7d", "volume"}
@@ -313,20 +314,19 @@ class PreIpoAdvisor:
             print(f"[PreIpoAdvisor] Reddit sentiment fetch failed for {ticker}: {e}")
             return {}
 
-    # ── 1. DXYZ reference data ──────────────────
+    # ── 1. Reference data (DXYZ + VCX) ─────────
 
-    def _fetch_dxyz_data(self) -> dict:
+    def _fetch_reference_data(self, ref_ticker: str) -> dict:
         """
-        Fetch DXYZ's full post-listing history from yfinance.
-        DXYZ (Destiny Tech100) listed ~March 26 2024 and is used as a lifecycle
-        reference for newly-listed closed-end / pre-IPO vehicle stocks.
+        Fetch a reference stock's full post-listing history from yfinance.
+        Used for both DXYZ (Destiny Tech100) and VCX.
         """
         try:
-            stock_obj = yf.Ticker(DXYZ_TICKER)
+            stock_obj = yf.Ticker(ref_ticker)
             hist = stock_obj.history(period="max")
 
             if hist is None or hist.empty:
-                print(f"[PreIpoAdvisor] yfinance returned no data for {DXYZ_TICKER}")
+                print(f"[PreIpoAdvisor] yfinance returned no data for {ref_ticker}")
                 return {}
 
             closes  = hist["Close"]
@@ -401,11 +401,11 @@ class PreIpoAdvisor:
                 for idx, row in hist.iterrows()
             ]
 
-            print(f"[PreIpoAdvisor] DXYZ data fetched: {trading_days} trading days "
+            print(f"[PreIpoAdvisor] {ref_ticker} data fetched: {trading_days} trading days "
                   f"since listing ({listing_date})")
 
             return {
-                "ticker":                    DXYZ_TICKER,
+                "ticker":                    ref_ticker,
                 "listing_date":              listing_date,
                 "listing_open_price":        listing_open_price,
                 "listing_close_price":       listing_close_price,
@@ -431,8 +431,14 @@ class PreIpoAdvisor:
             }
 
         except Exception as e:
-            print(f"[PreIpoAdvisor] DXYZ data fetch failed: {e}")
+            print(f"[PreIpoAdvisor] {ref_ticker} data fetch failed: {e}")
             return {}
+
+    def _fetch_dxyz_data(self) -> dict:
+        return self._fetch_reference_data(DXYZ_TICKER)
+
+    def _fetch_vcx_data(self) -> dict:
+        return self._fetch_reference_data(VCX_TICKER)
 
     # ── 2. Target stock data ────────────────────
 
@@ -680,7 +686,7 @@ class PreIpoAdvisor:
 
     # ── 3. Prompt construction ──────────────────
 
-    def build_prompt(self, dxyz_ctx: dict, target_ctx: dict) -> str:
+    def build_prompt(self, dxyz_ctx: dict, vcx_ctx: dict, target_ctx: dict) -> str:
         cp  = target_ctx["current_price"]
         sig = target_ctx["signal_type"]
 
@@ -884,6 +890,16 @@ class PreIpoAdvisor:
             or "  (Not available)"
         )
 
+        # ── VCX monthly / full OHLCV ──
+        vcx_monthly_json = (
+            json.dumps(vcx_ctx.get("monthly_summary", []), indent=2)
+            if vcx_ctx else "  (Not available)"
+        )
+        vcx_ohlcv_json = (
+            json.dumps(vcx_ctx.get("full_daily_ohlcv", []), indent=2)
+            if vcx_ctx else "  (Not available)"
+        )
+
         # ── Target stock monthly / 60d OHLCV ──
         target_monthly_json = (
             json.dumps(target_ctx["monthly_summary"], indent=2)
@@ -924,31 +940,49 @@ class PreIpoAdvisor:
                            dxyz_ctx.get("current_price"), ref),
         ])
 
+        # ── VCX price timeline block ──
+        vcx_ref = vcx_ctx.get("listing_open_price") if vcx_ctx else None
+        vcx_timeline = ""
+        if vcx_ctx:
+            vcx_timeline = "\n".join([
+                fmt_checkpoint("Listing open  (Day 0)", vcx_ref),
+                fmt_checkpoint("Listing close (Day 0)", vcx_ctx.get("listing_close_price"), vcx_ref),
+                fmt_checkpoint("Day 7",   vcx_ctx.get("price_day_7"),   vcx_ref),
+                fmt_checkpoint("Day 30",  vcx_ctx.get("price_day_30"),  vcx_ref),
+                fmt_checkpoint("Day 60",  vcx_ctx.get("price_day_60"),  vcx_ref),
+                fmt_checkpoint("Day 90",  vcx_ctx.get("price_day_90"),  vcx_ref),
+                fmt_checkpoint("Day 180", vcx_ctx.get("price_day_180"), vcx_ref),
+                fmt_checkpoint("Day 365", vcx_ctx.get("price_day_365"), vcx_ref),
+                fmt_checkpoint(f"Current ({vcx_ctx.get('days_since_listing', '?')} calendar days post-listing)",
+                               vcx_ctx.get("current_price"), vcx_ref),
+            ])
+
         # ── Position sizing instruction (SELL only) ──
         if sig == "SELL":
             position_sizing_instruction = """
 POSITION SIZING (required for SELL signal):
 You MUST include a "position_sizing" object in your response with:
   - "sell_pct_now" : integer 0–100 — what % of the position to sell immediately
-  - "rationale"    : string — derive this from DXYZ's actual post-listing phases.
-                     Identify which DXYZ lifecycle phase the target stock is currently in,
-                     what DXYZ did next from that equivalent stage, and why the
-                     recommended % is appropriate given that precedent.
+  - "rationale"    : string — derive this from DXYZ's and VCX's actual post-listing phases.
+                     Identify which lifecycle phase the target stock is currently in
+                     (referencing both DXYZ and VCX where applicable), what both references
+                     did next from that equivalent stage, and why the recommended % is
+                     appropriate given that combined precedent.
   - "staged_approach" : string — when/how to sell the remaining position
                          (e.g. "Sell remaining 50% if premium exceeds X% or 7d change > Y%")
-                         Tie thresholds to DXYZ's actual turning-point levels.
+                         Tie thresholds to actual turning-point levels from DXYZ and/or VCX.
 
-Think of this as a staged exit strategy anchored to DXYZ's lifecycle data.
+Think of this as a staged exit strategy anchored to both DXYZ and VCX lifecycle data.
 """
         else:
             position_sizing_instruction = (
                 '(BUY signal — "position_sizing" is optional. '
                 'You may include it to suggest how much to accumulate if you see '
-                'a DXYZ-pattern-supported dip buy opportunity.)'
+                'a DXYZ/VCX-pattern-supported dip buy opportunity.)'
             )
 
         return f"""You are a financial analysis assistant specialising in post-IPO / post-listing
-closed-end fund dynamics, with deep knowledge of DXYZ (Destiny Tech100) as a lifecycle reference.
+closed-end fund dynamics, with deep knowledge of DXYZ (Destiny Tech100) and VCX as lifecycle references.
 
 Today: {target_ctx['analysis_time']}
 User's signal intent: {sig}
@@ -982,6 +1016,36 @@ DXYZ MONTHLY CLOSE SUMMARY
 
 DXYZ FULL DAILY OHLCV (since listing — use this to identify key phases, turning points, and volume signals)
 {dxyz_ohlcv_json}
+
+════════════════════════════════
+SECTION 1b — VCX REFERENCE DATA  ★ SECOND LIFECYCLE REFERENCE ★
+VCX is a more recent post-listing reference. Use it alongside DXYZ to triangulate
+lifecycle phases and calibrate thresholds. Note VCX may have fewer trading days.
+════════════════════════════════
+Ticker         : {VCX_TICKER} (VCX — closed-end/pre-IPO vehicle, listed 2026)
+Listing date   : {vcx_ctx.get('listing_date', 'N/A') if vcx_ctx else 'N/A'}
+Calendar days since listing : {vcx_ctx.get('days_since_listing', 'N/A') if vcx_ctx else 'N/A'}
+Trading days of data        : {vcx_ctx.get('trading_days_since_listing', 'N/A') if vcx_ctx else 'N/A'}
+
+POST-LISTING PRICE TIMELINE
+{vcx_timeline if vcx_ctx else '  (Not available)'}
+
+ALL-TIME HIGH (post-listing)
+  ATH price    : {_fmt_price(vcx_ctx.get('ath_price')) if vcx_ctx else 'N/A'}
+  ATH date     : {vcx_ctx.get('ath_date', 'N/A') if vcx_ctx else 'N/A'}
+  Days to ATH from listing : {vcx_ctx.get('days_to_ath', 'N/A') if vcx_ctx else 'N/A'}
+  Current drawdown from ATH: {_fmt_pct(vcx_ctx.get('drawdown_from_ath_pct')) if vcx_ctx else 'N/A'}
+
+VOLUME PATTERNS
+  Listing day volume        : {f"{vcx_ctx.get('listing_day_volume', 0):,}" if vcx_ctx and vcx_ctx.get('listing_day_volume') else 'N/A'}
+  Avg volume days 1–10      : {f"{vcx_ctx.get('avg_vol_10d_post_listing', 0):,}" if vcx_ctx and vcx_ctx.get('avg_vol_10d_post_listing') else 'N/A'}
+  Avg volume last 30d       : {f"{vcx_ctx.get('avg_vol_30d_current', 0):,}" if vcx_ctx and vcx_ctx.get('avg_vol_30d_current') else 'N/A'}
+
+VCX MONTHLY CLOSE SUMMARY
+{vcx_monthly_json}
+
+VCX FULL DAILY OHLCV (since listing — use this alongside DXYZ to identify phases and volume signals)
+{vcx_ohlcv_json}
 
 ════════════════════════════════
 SECTION 2 — TARGET STOCK DATA
@@ -1053,14 +1117,21 @@ Step 1 — Analyse DXYZ lifecycle phases from the OHLCV data above:
   • Phase 3: Selloff — pace, magnitude, duration, key support levels
   • Phase 4: Current state — stabilisation, renewed decline, or recovery?
 
-Step 2 — Map the target stock ({target_ctx['ticker']}) onto the DXYZ lifecycle:
-  • Based on days since own listing and current price/volume/premium, which DXYZ
-    phase does the target most closely resemble?
-  • How many DXYZ-equivalent days into that phase does it appear to be?
+Step 1b — Analyse VCX lifecycle phases from the VCX OHLCV data above:
+  • Repeat the same phase analysis for VCX (note: VCX may still be in early phases)
+  • Compare VCX's euphoria speed and magnitude against DXYZ's equivalent phase
+  • Note where VCX diverges from the DXYZ playbook (faster/slower ATH, different volume patterns)
 
-Step 3 — Derive DXYZ-calibrated alert thresholds:
-  • Use DXYZ's actual turning-point prices, premiums, and volume ratios as anchors
-  • Alerts should fire at levels that would have been meaningful signals in DXYZ
+Step 2 — Map the target stock ({target_ctx['ticker']}) onto both reference lifecycles:
+  • Based on days since own listing and current price/volume/premium, which phase in
+    DXYZ and VCX does the target most closely resemble?
+  • Which reference is a better fit, and why?
+  • How many equivalent days into that phase does the target appear to be?
+
+Step 3 — Derive alert thresholds anchored to both references:
+  • Use turning-point prices, premiums, and volume ratios from BOTH DXYZ and VCX
+  • Where DXYZ and VCX agree on a level, that threshold is higher conviction
+  • Where they diverge, note which reference you are weighting and why
 
 {position_sizing_instruction}
 
@@ -1278,13 +1349,19 @@ Return ONLY valid JSON — no markdown fences, no comments, no text outside the 
                         "error": "Failed to fetch DXYZ reference data from yfinance. "
                                  "Check your internet connection and try again."}
 
+            print(f"[PreIpoAdvisor] Fetching VCX reference data...")
+            vcx_ctx = self._fetch_vcx_data()
+            if not vcx_ctx:
+                print(f"[PreIpoAdvisor] VCX data unavailable — continuing without it")
+
             print(f"[PreIpoAdvisor] Fetching target data for {ticker} ({signal_type})...")
             target_ctx = self._fetch_target_data(ticker, nav, signal_type, history_data)
 
             print(f"[PreIpoAdvisor] Building prompt "
                   f"({dxyz_ctx['trading_days_since_listing']} DXYZ days, "
+                  f"{vcx_ctx.get('trading_days_since_listing', 0) if vcx_ctx else 0} VCX days, "
                   f"{target_ctx['data_days']} target days)...")
-            prompt = self.build_prompt(dxyz_ctx, target_ctx)
+            prompt = self.build_prompt(dxyz_ctx, vcx_ctx, target_ctx)
 
             print(f"[PreIpoAdvisor] Calling {PRE_IPO_AI_MODEL} via Openrouter...")
             raw = self.call_openrouter(prompt)
